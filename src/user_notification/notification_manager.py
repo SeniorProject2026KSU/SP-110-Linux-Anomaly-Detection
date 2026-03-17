@@ -23,3 +23,7 @@ class NotificationManager():
         if body == "default":
             body = f"Dear {self.user_name},\n\nAn anomaly of severity {severity} has been detected on device {self.user_device}. We recommend checking your device.\n\n Thank you for using our service,\nSP-110 Green Team"
         pass
+    
+    def send_custom_notification():
+        # appends header and footer to body of custom body and subject and sends
+        pass
