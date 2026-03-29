@@ -1,0 +1,15 @@
+# Copy this file to .env (at repo root) and fill in your real values.
+# Do NOT commit your real .env file.
+
+#DO NOT CHANGE
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USE_SSL=true
+
+# SMTP login email address
+# CHANGE
+SMTP_USERNAME=your_email@gmail.com
+
+# For Gmail, use a 16-character App Password, not your normal password
+# CHANGE
+SMTP_PASSWORD=replace_me_with_app_password
