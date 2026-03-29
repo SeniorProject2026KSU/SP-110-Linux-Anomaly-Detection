@@ -46,7 +46,7 @@ When anomalies are detected, the system can notify users via email.
 
 ## Project Structure
 
-
+```
 project_root/
 ├── .env
 ├── src/
@@ -55,7 +55,7 @@ project_root/
 │ │ ├── init.py
 │ │ └── notification_manager.py
 │ └── (future modules)
-
+```
 
 ---
 
