@@ -24,9 +24,10 @@ pip install python-dotenv
 
 2. Create .env in project root
 
-Do not place this inside the package.
+> Do not place this inside the package.
 
 Example:
+```
 
 SMTP_HOST=smtp.example.com
 SMTP_PORT=465
@@ -34,6 +35,7 @@ SMTP_USE_SSL=true
 
 SMTP_USERNAME=your_email@example.com
 SMTP_PASSWORD=your_password_here
+```
 
 ---
 
