@@ -26,9 +26,7 @@ def build_config():
 
 def main():
     load_dotenv()
-
     config = build_config()
-
     notifier = NotificationManager(config)
 
     # Change these values and run from root to test!
@@ -36,8 +34,20 @@ def main():
     notifier.set_user_name("Colin")
     notifier.set_user_device("Laptop")
 
+
+    ####################
+    # DEMO LOOP
+    """
+    Simulates scanning of system. sends email and ends at demo_threshold
+    """
+    ####################
+
+    #knobs
+    demo_threshold = 65
+    time_per_scan = 3
+
     while True:
-        severity = MockDetector.simulate_detection(3)
+        severity = MockDetector.simulate_detection(time_per_scan)
         print(f"""
               
 
@@ -46,12 +56,11 @@ def main():
 SCAN RESULT: ANOMOLY SCORE = {severity}%        
 ----              
 """)
-        if severity > 60:
+        if severity > demo_threshold:
             notifier.send_anomaly_notification(severity)
             break
 
 
-    
 
 if __name__ == "__main__":
     main()
