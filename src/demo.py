@@ -30,8 +30,8 @@ def main():
     notifier = NotificationManager(config)
 
     # Change these values and run from root to test!
-    notifier.set_user_email("colinhaskins2021@gmail.com")
-    notifier.set_user_name("Colin")
+    notifier.set_user_email("CHANGEME@gmail.com")
+    notifier.set_user_name("CHANGEME")
     notifier.set_user_device("Laptop")
 
 
