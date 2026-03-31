@@ -1,5 +1,6 @@
 # backend.py
 import pandas as pd
+import psycopg2
 
 # Placeholder functions
 
