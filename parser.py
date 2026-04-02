@@ -8,7 +8,10 @@ def parse(line: str):
     original_line = line.strip()
     lower = original_line.lower()
 
-    # Skip noisy auditd / systemd lines
+    if "journal" in source_type.lower() or any(x in line for x in ["sshd", "sudo", "systemd"]):
+    
+        pass
+    
     if any(x in lower for x in ["type=proctitle", "type=path", "type=syscall", "type=execve",
                                 "type=cwd", "msg=audit(", "key=\"exec_log\"", "type=service_start"]):
         return None

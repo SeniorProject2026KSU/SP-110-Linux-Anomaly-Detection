@@ -1,8 +1,12 @@
 import os
 
-SERVER_HOST = "0.0.0.0"
-SERVER_PORT = 5000
-SERVER_URL = f"http://localhost:{SERVER_PORT}/ingest"
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", 5000))
+
+SERVER_URL = os.environ.get(
+    "SERVER_URL",
+    f"http://{SERVER_HOST}:{SERVER_PORT}/ingest"
+)
 
 DB_CONFIG = {
     "host": os.environ.get("DB_HOST", "localhost"),
@@ -11,7 +15,7 @@ DB_CONFIG = {
     "password": os.environ.get("DB_PASSWORD", "password"),
 }
 
-LOG_FILES = [
+TEXT_LOG_FILES = os.environ.get("LOG_FILES", "").split(",") if os.environ.get("LOG_FILES") else [
     "/var/log/auth.log",
     "/var/log/syslog",
     "/var/log/kern.log",
@@ -22,6 +26,10 @@ LOG_FILES = [
     "/home/kubuntu/.bash_history"
 ]
 
+JOURNAL_UNITS = os.environ.get("JOURNAL_UNITS", "sshd,sudo,systemd,auth").split(",") if os.environ.get("JOURNAL_UNITS") else [
+    "sshd", "sudo", "systemd", "user"   # "user" catches most user sessions
+]
+
 API_KEY = os.environ.get("SOC_API_KEY", "API_KEY")
-if not API_KEY:
-    raise RuntimeError("API_KEY environment variable is not set. Refusing to start.")
+if not API_KEY or API_KEY == "API_KEY":
+    raise RuntimeError("SOC_API_KEY environment variable is not set.")
