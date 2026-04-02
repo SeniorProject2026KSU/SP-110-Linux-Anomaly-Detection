@@ -1,17 +1,18 @@
 import re
 from datetime import datetime, timezone
 
-def parse(line: str):
+def parse(line: str, source_type: str = "SYS"):
     if not line or not line.strip():
         return None
 
     original_line = line.strip()
     lower = original_line.lower()
 
+    # Filter out journal metadata/header lines (e.g. "-- Logs begin at ...", "-- No entries --")
     if "journal" in source_type.lower() or any(x in line for x in ["sshd", "sudo", "systemd"]):
-    
-        pass
-    
+        if original_line.startswith("--") or "logs begin" in lower or "no entries" in lower:
+            return None
+
     if any(x in lower for x in ["type=proctitle", "type=path", "type=syscall", "type=execve",
                                 "type=cwd", "msg=audit(", "key=\"exec_log\"", "type=service_start"]):
         return None

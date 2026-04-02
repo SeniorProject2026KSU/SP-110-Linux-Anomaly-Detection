@@ -13,54 +13,95 @@ import json
 import hashlib
 import subprocess
 import platform
+import threading
+import time
+import requests as http_requests
 
 app = Flask(__name__)
 
-# MITRE ATT&CK mapping
+# ─── MITRE ATT&CK v15 — 29 techniques across 9 event types ─────────────────
 MITRE_MAP = {
     "SUSPICIOUS_COMMAND": [
-        {"id": "T1059", "name": "Command and Scripting Interpreter", "tactic": "Execution"},
-        {"id": "T1070.003", "name": "Clear Command History",          "tactic": "Defense Evasion"},
+        {"id": "T1059",     "name": "Command and Scripting Interpreter", "tactic": "Execution"},
+        {"id": "T1059.004", "name": "Unix Shell",                        "tactic": "Execution"},
+        {"id": "T1070.003", "name": "Clear Command History",             "tactic": "Defense Evasion"},
+        {"id": "T1070.004", "name": "File Deletion",                     "tactic": "Defense Evasion"},
+        {"id": "T1219",     "name": "Remote Access Tools",               "tactic": "Command and Control"},
     ],
     "AUTH": [
-        {"id": "T1110", "name": "Brute Force",             "tactic": "Credential Access"},
-        {"id": "T1078", "name": "Valid Accounts",          "tactic": "Persistence"},
+        {"id": "T1110",     "name": "Brute Force",                       "tactic": "Credential Access"},
+        {"id": "T1110.001", "name": "Password Guessing",                 "tactic": "Credential Access"},
+        {"id": "T1078",     "name": "Valid Accounts",                    "tactic": "Persistence"},
+        {"id": "T1021.004", "name": "SSH Remote Services",               "tactic": "Lateral Movement"},
     ],
     "SUDO": [
-        {"id": "T1548.003", "name": "Sudo and Sudo Caching", "tactic": "Privilege Escalation"},
-        {"id": "T1078",     "name": "Valid Accounts",         "tactic": "Persistence"},
+        {"id": "T1548.003", "name": "Sudo and Sudo Caching",             "tactic": "Privilege Escalation"},
+        {"id": "T1078",     "name": "Valid Accounts",                    "tactic": "Persistence"},
+        {"id": "T1068",     "name": "Exploitation for Privilege Escalation", "tactic": "Privilege Escalation"},
     ],
     "BASH_HISTORY": [
-        {"id": "T1059.004", "name": "Unix Shell",              "tactic": "Execution"},
-        {"id": "T1552.003", "name": "Bash History",            "tactic": "Credential Access"},
+        {"id": "T1059.004", "name": "Unix Shell",                        "tactic": "Execution"},
+        {"id": "T1552.003", "name": "Bash History",                      "tactic": "Credential Access"},
+        {"id": "T1083",     "name": "File and Directory Discovery",      "tactic": "Discovery"},
+    ],
+    "SYS": [
+        {"id": "T1082",     "name": "System Information Discovery",      "tactic": "Discovery"},
+        {"id": "T1518",     "name": "Software Discovery",                "tactic": "Discovery"},
+    ],
+    "CRON": [
+        {"id": "T1053.003", "name": "Cron Job Scheduled Task",           "tactic": "Persistence"},
+        {"id": "T1053",     "name": "Scheduled Task/Job",                "tactic": "Execution"},
+    ],
+    "PKG_MGMT": [
+        {"id": "T1072",     "name": "Software Deployment Tools",         "tactic": "Execution"},
+        {"id": "T1195",     "name": "Supply Chain Compromise",           "tactic": "Initial Access"},
+        {"id": "T1543",     "name": "Create or Modify System Process",   "tactic": "Persistence"},
+    ],
+    "NET_CHANGE": [
+        {"id": "T1049",     "name": "System Network Connections Discovery", "tactic": "Discovery"},
+        {"id": "T1071",     "name": "Application Layer Protocol",        "tactic": "Command and Control"},
+        {"id": "T1090",     "name": "Proxy",                             "tactic": "Command and Control"},
+    ],
+    "SYS_ERROR": [
+        {"id": "T1499",     "name": "Endpoint Denial of Service",        "tactic": "Impact"},
+        {"id": "T1485",     "name": "Data Destruction",                  "tactic": "Impact"},
+        {"id": "T1562",     "name": "Impair Defenses",                   "tactic": "Defense Evasion"},
     ],
 }
 
-# Event-type colors
+# ─── Event-type colors ───────────────────────────────────────────────────────
 ETYPE_COLORS = {
     "AUTH":               "var(--red)",
     "SUDO":               "var(--orange)",
     "SUSPICIOUS_COMMAND": "var(--red)",
     "BASH_HISTORY":       "var(--purple)",
     "SYS":                "var(--muted)",
+    "CRON":               "var(--cyan)",
+    "PKG_MGMT":           "var(--blue)",
+    "NET_CHANGE":         "var(--yellow)",
+    "SYS_ERROR":          "var(--orange)",
 }
 
-# Severity classifier
+# ─── Severity classifier ────────────────────────────────────────────────────
 def classify(eventtype, success, message):
     msg = (message or "").lower()
     if eventtype == "SUSPICIOUS_COMMAND":
         return 3, "CRITICAL"
+    if eventtype == "SYS_ERROR":
+        return 2, "HIGH"
     if eventtype == "AUTH" and success == 0:
         if any(x in msg for x in ["invalid user", "root", "admin"]):
             return 3, "CRITICAL"
         return 2, "HIGH"
     if eventtype == "SUDO":
         return 2, "HIGH"
+    if eventtype == "NET_CHANGE":
+        return 1, "MEDIUM"
     if success == 0:
         return 1, "MEDIUM"
     return 0, "LOW"
 
-# DB helpers
+# ─── DB helpers ─────────────────────────────────────────────────────────────
 def get_db_connection(db_name=None):
     cfg = DB_CONFIG.copy()
     if db_name:
@@ -78,7 +119,7 @@ def list_databases():
         dbs = [r[0] for r in cur.fetchall()]
         cur.close(); conn.close()
         return dbs
-    except Exception as e:
+    except Exception:
         return []
 
 def create_database_and_tables(db_name):
@@ -94,7 +135,7 @@ def create_database_and_tables(db_name):
         cur.close(); conn.close()
 
         conn2 = get_db_connection(db_name)
-        cur2  = conn2.cursor()
+        cur2 = conn2.cursor()
         cur2.execute("""
             CREATE TABLE IF NOT EXISTS Logs (
                 logid SERIAL PRIMARY KEY,
@@ -121,6 +162,7 @@ def create_database_and_tables(db_name):
                 title TEXT,
                 status VARCHAR(20),
                 severity VARCHAR(20),
+                framework_tags TEXT,
                 checked_at TIMESTAMP DEFAULT NOW()
             );
         """)
@@ -133,7 +175,7 @@ def create_database_and_tables(db_name):
     except Exception as e:
         return False, str(e)
 
-# FIM helpers
+# ─── FIM ────────────────────────────────────────────────────────────────────
 def fim_scan(paths=None):
     default_paths = ["/etc/passwd", "/etc/shadow", "/etc/sudoers",
                      "/etc/hosts", "/etc/crontab", "/root/.bashrc"]
@@ -151,84 +193,369 @@ def fim_scan(paths=None):
                              "mtime": 0, "status": str(e)})
     return results
 
-# SCA checks
+# ─── SCA — 32 CIS Benchmark checks ──────────────────────────────────────────
 def run_sca():
     checks = []
-    def chk(cid, title, sev, passed, detail=""):
+
+    def chk(cid, title, sev, passed, detail="", tags=""):
         checks.append({"id": cid, "title": title, "severity": sev,
-                        "status": "PASS" if passed else "FAIL", "detail": detail})
+                        "status": "PASS" if passed else "FAIL",
+                        "detail": detail, "tags": tags})
 
-    # Root login via SSH
-    try:
-        with open("/etc/ssh/sshd_config") as f:
-            cfg = f.read()
-        chk("SCA-001", "SSH: PermitRootLogin disabled", "HIGH",
-            "permitrootlogin no" in cfg.lower() or "permitrootlogin prohibit-password" in cfg.lower())
-    except:
-        chk("SCA-001", "SSH: PermitRootLogin disabled", "HIGH", False, "sshd_config not readable")
+    def read_file(path):
+        try:
+            with open(path) as f:
+                return f.read()
+        except Exception:
+            return ""
 
-    # Password authentication
-    try:
-        with open("/etc/ssh/sshd_config") as f:
-            cfg = f.read()
-        chk("SCA-002", "SSH: PasswordAuthentication disabled", "MEDIUM",
-            "passwordauthentication no" in cfg.lower())
-    except:
-        chk("SCA-002", "SSH: PasswordAuthentication disabled", "MEDIUM", False)
+    def cmd(c, timeout=3):
+        try:
+            r = subprocess.run(c, capture_output=True, text=True, timeout=timeout, shell=isinstance(c, str))
+            return r.stdout + r.stderr
+        except Exception:
+            return ""
 
-    # World-writable /tmp
-    try:
-        s = os.stat("/tmp")
-        chk("SCA-003", "/tmp has sticky bit set", "LOW", bool(s.st_mode & 0o1000))
-    except:
-        chk("SCA-003", "/tmp has sticky bit set", "LOW", False)
+    sshd = read_file("/etc/ssh/sshd_config").lower()
+    login_defs = read_file("/etc/login.defs").lower()
+    pam_common = read_file("/etc/pam.d/common-password").lower()
+    sysctl_out = cmd("sysctl -a", timeout=5)
 
-    # UFW/iptables active
-    try:
-        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=3)
-        active = "active" in r.stdout.lower()
-        chk("SCA-004", "Firewall (ufw) is active", "HIGH", active)
-    except:
-        chk("SCA-004", "Firewall (ufw) is active", "HIGH", False, "ufw not found")
+    # ── SSH Hardening (10 checks) ──────────────────────────────────────────
+    chk("SSH-001", "SSH: PermitRootLogin disabled",       "HIGH",
+        "permitrootlogin no" in sshd or "permitrootlogin prohibit-password" in sshd,
+        tags="PCI-DSS:8.2.1,HIPAA:164.312(a),NIST:PR.AC-1")
+    chk("SSH-002", "SSH: PasswordAuthentication disabled", "MEDIUM",
+        "passwordauthentication no" in sshd,
+        tags="PCI-DSS:8.3.6,HIPAA:164.312(d),NIST:PR.AC-1")
+    chk("SSH-003", "SSH: Protocol 2 enforced",            "HIGH",
+        "protocol 1" not in sshd,
+        tags="PCI-DSS:4.2.1,NIST:PR.DS-2")
+    chk("SSH-004", "SSH: MaxAuthTries <= 4",               "MEDIUM",
+        any(f"maxauthtries {n}" in sshd for n in ["1","2","3","4"]),
+        tags="PCI-DSS:8.3.4,NIST:PR.AC-7")
+    chk("SSH-005", "SSH: X11Forwarding disabled",          "LOW",
+        "x11forwarding no" in sshd,
+        tags="NIST:PR.AC-5")
+    chk("SSH-006", "SSH: LoginGraceTime <= 60s",           "LOW",
+        any(f"logingracetime {n}" in sshd for n in ["30","45","60","1m"]) or "logingracetime 0" not in sshd,
+        tags="NIST:DE.CM-1")
+    chk("SSH-007", "SSH: PermitEmptyPasswords disabled",   "CRITICAL",
+        "permitemptypasswords no" in sshd or "permitemptypasswords" not in sshd,
+        tags="PCI-DSS:8.3.6,HIPAA:164.312(d),NIST:PR.AC-1")
+    chk("SSH-008", "SSH: AllowUsers or AllowGroups configured", "MEDIUM",
+        "allowusers" in sshd or "allowgroups" in sshd,
+        detail="No user restriction configured",
+        tags="PCI-DSS:7.3,NIST:PR.AC-4")
+    chk("SSH-009", "SSH: ClientAliveInterval configured",  "LOW",
+        "clientaliveinterval" in sshd,
+        tags="NIST:DE.CM-1")
+    chk("SSH-010", "SSH: IgnoreRhosts enabled",            "HIGH",
+        "ignorerhosts yes" in sshd or "ignorerhosts" not in sshd,
+        tags="PCI-DSS:2.2.7,NIST:PR.AC-5")
 
-    # Empty passwords
+    # ── Account / Password Policy (5 checks) ──────────────────────────────
     try:
         with open("/etc/shadow") as f:
             empty = any(line.split(":")[1] == "" for line in f if ":" in line)
-        chk("SCA-005", "No accounts with empty passwords", "CRITICAL", not empty)
-    except:
-        chk("SCA-005", "No accounts with empty passwords", "CRITICAL", False, "Cannot read /etc/shadow")
+        chk("ACC-001", "No accounts with empty passwords", "CRITICAL", not empty,
+            tags="PCI-DSS:8.3.6,HIPAA:164.312(d),NIST:PR.AC-1")
+    except Exception:
+        chk("ACC-001", "No accounts with empty passwords", "CRITICAL", False,
+            detail="Cannot read /etc/shadow",
+            tags="PCI-DSS:8.3.6,HIPAA:164.312(d),NIST:PR.AC-1")
+
+    pass_max = ""
+    for line in login_defs.splitlines():
+        if line.strip().startswith("pass_max_days"):
+            pass_max = line.split()[-1].strip()
+    chk("ACC-002", "Password max age <= 90 days", "MEDIUM",
+        pass_max.isdigit() and int(pass_max) <= 90,
+        detail=f"Current: {pass_max or 'unset'}",
+        tags="PCI-DSS:8.3.9,HIPAA:164.308(a)(5),NIST:PR.AC-1")
+
+    pass_min = ""
+    for line in login_defs.splitlines():
+        if line.strip().startswith("pass_min_len"):
+            pass_min = line.split()[-1].strip()
+    chk("ACC-003", "Password minimum length >= 14", "MEDIUM",
+        pass_min.isdigit() and int(pass_min) >= 14,
+        detail=f"Current: {pass_min or 'unset'}",
+        tags="PCI-DSS:8.3.6,NIST:PR.AC-1")
+
+    chk("ACC-004", "PAM password complexity configured", "MEDIUM",
+        "pam_pwquality" in pam_common or "pam_cracklib" in pam_common,
+        tags="PCI-DSS:8.3.6,HIPAA:164.308(a)(5),NIST:PR.AC-1")
+
+    root_uid0 = cmd("awk -F: '($3==0){print $1}' /etc/passwd").strip()
+    chk("ACC-005", "Only root has UID 0", "CRITICAL",
+        root_uid0 == "root",
+        detail=f"UID-0 accounts: {root_uid0}",
+        tags="PCI-DSS:7.2,HIPAA:164.312(a),NIST:PR.AC-4")
+
+    # ── Filesystem Permissions (4 checks) ─────────────────────────────────
+    try:
+        s = os.stat("/tmp")
+        chk("FS-001", "/tmp has sticky bit set", "LOW", bool(s.st_mode & 0o1000),
+            tags="NIST:PR.DS-1")
+    except Exception:
+        chk("FS-001", "/tmp has sticky bit set", "LOW", False)
+
+    try:
+        s = os.stat("/etc/passwd")
+        chk("FS-002", "/etc/passwd permissions are 644 or tighter", "HIGH",
+            oct(s.st_mode)[-3:] in ("644", "640", "600"),
+            detail=f"Current: {oct(s.st_mode)[-3:]}",
+            tags="PCI-DSS:10.3.2,NIST:PR.DS-1")
+    except Exception:
+        chk("FS-002", "/etc/passwd permissions are 644 or tighter", "HIGH", False)
+
+    try:
+        s = os.stat("/etc/shadow")
+        chk("FS-003", "/etc/shadow permissions are 640 or tighter", "CRITICAL",
+            oct(s.st_mode)[-3:] in ("640", "600", "000"),
+            detail=f"Current: {oct(s.st_mode)[-3:]}",
+            tags="PCI-DSS:8.3.6,HIPAA:164.312(a),NIST:PR.DS-1")
+    except Exception:
+        chk("FS-003", "/etc/shadow permissions are 640 or tighter", "CRITICAL", False,
+            detail="Cannot stat /etc/shadow")
+
+    world_writable = cmd("find / -xdev -type f -perm -0002 2>/dev/null | head -5", timeout=8).strip()
+    chk("FS-004", "No world-writable files outside /tmp", "HIGH",
+        not bool(world_writable),
+        detail=world_writable[:100] if world_writable else "",
+        tags="NIST:PR.DS-1,PCI-DSS:10.3.2")
+
+    # ── Network / Firewall (5 checks) ─────────────────────────────────────
+    ufw_out = cmd(["ufw", "status"])
+    chk("NET-001", "Firewall (UFW) is active", "HIGH",
+        "active" in ufw_out.lower(),
+        detail="ufw status: " + (ufw_out.strip().splitlines()[0] if ufw_out.strip() else "not found"),
+        tags="PCI-DSS:1.3,HIPAA:164.312(e),NIST:PR.AC-5")
+
+    ip_forward = ""
+    for line in sysctl_out.splitlines():
+        if "net.ipv4.ip_forward" in line:
+            ip_forward = line.split("=")[-1].strip()
+    chk("NET-002", "IPv4 forwarding disabled (unless router)", "MEDIUM",
+        ip_forward == "0",
+        detail=f"net.ipv4.ip_forward = {ip_forward or 'unknown'}",
+        tags="NIST:PR.AC-5")
+
+    icmp_redirect = ""
+    for line in sysctl_out.splitlines():
+        if "net.ipv4.conf.all.accept_redirects" in line:
+            icmp_redirect = line.split("=")[-1].strip()
+    chk("NET-003", "ICMP redirects disabled", "MEDIUM",
+        icmp_redirect == "0",
+        detail=f"accept_redirects = {icmp_redirect or 'unknown'}",
+        tags="PCI-DSS:1.3,NIST:PR.AC-5")
+
+    rp_filter = ""
+    for line in sysctl_out.splitlines():
+        if "net.ipv4.conf.all.rp_filter" in line:
+            rp_filter = line.split("=")[-1].strip()
+    chk("NET-004", "Reverse path filtering enabled", "LOW",
+        rp_filter in ("1", "2"),
+        detail=f"rp_filter = {rp_filter or 'unknown'}",
+        tags="NIST:PR.AC-5")
+
+    syn_cookies = ""
+    for line in sysctl_out.splitlines():
+        if "net.ipv4.tcp_syncookies" in line:
+            syn_cookies = line.split("=")[-1].strip()
+    chk("NET-005", "TCP SYN cookies enabled", "LOW",
+        syn_cookies == "1",
+        detail=f"tcp_syncookies = {syn_cookies or 'unknown'}",
+        tags="NIST:DE.CM-1")
+
+    # ── Services / Software (8 checks) ────────────────────────────────────
+    avahi = cmd(["systemctl", "is-active", "avahi-daemon"]).strip()
+    chk("SVC-001", "Avahi daemon disabled", "MEDIUM",
+        avahi not in ("active", "running"),
+        detail=f"avahi-daemon: {avahi}",
+        tags="NIST:PR.AC-5")
+
+    cups = cmd(["systemctl", "is-active", "cups"]).strip()
+    chk("SVC-002", "CUPS (printing) disabled", "LOW",
+        cups not in ("active", "running"),
+        detail=f"cups: {cups}",
+        tags="NIST:PR.AC-5")
+
+    telnet_out = cmd("dpkg -l telnet 2>/dev/null | grep '^ii'").strip()
+    chk("SVC-003", "Telnet client not installed", "HIGH",
+        not bool(telnet_out),
+        tags="PCI-DSS:2.2.7,HIPAA:164.312(e),NIST:PR.DS-2")
+
+    rsh_out = cmd("dpkg -l rsh-client 2>/dev/null | grep '^ii'").strip()
+    chk("SVC-004", "rsh client not installed", "HIGH",
+        not bool(rsh_out),
+        tags="PCI-DSS:2.2.7,NIST:PR.DS-2")
+
+    auditd = cmd(["systemctl", "is-active", "auditd"]).strip()
+    chk("SVC-005", "Auditd service is running", "MEDIUM",
+        auditd in ("active", "running"),
+        detail=f"auditd: {auditd}",
+        tags="PCI-DSS:10.1,HIPAA:164.312(b),NIST:DE.CM-7")
+
+    rsyslog = cmd(["systemctl", "is-active", "rsyslog"]).strip()
+    syslog_ng = cmd(["systemctl", "is-active", "syslog-ng"]).strip()
+    chk("SVC-006", "Syslog service is running", "MEDIUM",
+        rsyslog in ("active","running") or syslog_ng in ("active","running"),
+        tags="PCI-DSS:10.1,HIPAA:164.312(b),NIST:DE.CM-7")
+
+    at_allow = os.path.exists("/etc/at.allow")
+    cron_allow = os.path.exists("/etc/cron.allow")
+    chk("SVC-007", "cron/at access controlled via allow-lists", "LOW",
+        at_allow and cron_allow,
+        detail="Missing: " + (", ".join(filter(None, ["/etc/at.allow" if not at_allow else "", "/etc/cron.allow" if not cron_allow else ""])) or "none"),
+        tags="NIST:PR.AC-4")
+
+    unattended = cmd("dpkg -l unattended-upgrades 2>/dev/null | grep '^ii'").strip()
+    chk("SVC-008", "Automatic security updates configured", "MEDIUM",
+        bool(unattended),
+        tags="PCI-DSS:6.3.3,NIST:ID.RA-1")
 
     return checks
 
-# Vulnerability scan stub
+# ─── Vulnerability Scan — NVD live + offline baseline ───────────────────────
+NVD_OFFLINE = [
+    {"package": "openssh-server", "cve": "CVE-2024-6387", "severity": "CRITICAL",
+     "description": "regreSSHion — unauthenticated RCE in OpenSSH glibc-based systems"},
+    {"package": "glibc",          "cve": "CVE-2023-4911", "severity": "CRITICAL",
+     "description": "Looney Tunables — local privilege escalation via GLIBC_TUNABLES"},
+    {"package": "sudo",           "cve": "CVE-2021-3156", "severity": "CRITICAL",
+     "description": "Baron Samedit — heap-based buffer overflow in sudoedit"},
+    {"package": "polkit",         "cve": "CVE-2021-4034", "severity": "CRITICAL",
+     "description": "PwnKit — local privilege escalation in pkexec"},
+    {"package": "bash",           "cve": "CVE-2014-6271", "severity": "CRITICAL",
+     "description": "Shellshock — arbitrary code execution via env variables"},
+    {"package": "openssl",        "cve": "CVE-2022-0778", "severity": "HIGH",
+     "description": "Infinite loop via crafted certificate in BN_mod_sqrt()"},
+    {"package": "openssl",        "cve": "CVE-2023-0286", "severity": "HIGH",
+     "description": "X.400 address type confusion in GeneralName"},
+    {"package": "curl",           "cve": "CVE-2023-23914", "severity": "MEDIUM",
+     "description": "HSTS bypass via clear-text downgrade"},
+    {"package": "wget",           "cve": "CVE-2021-31879", "severity": "MEDIUM",
+     "description": "Authorization header exposure on redirect"},
+    {"package": "vim",            "cve": "CVE-2022-1898", "severity": "HIGH",
+     "description": "Use-after-free in vim before 8.2.4970"},
+    {"package": "git",            "cve": "CVE-2023-25652", "severity": "HIGH",
+     "description": "Path traversal via git apply --reject"},
+    {"package": "python3",        "cve": "CVE-2023-24329", "severity": "MEDIUM",
+     "description": "urllib.parse bypass via empty string in scheme"},
+    {"package": "libssl3",        "cve": "CVE-2022-0778", "severity": "HIGH",
+     "description": "OpenSSL BN_mod_sqrt infinite loop"},
+    {"package": "zlib1g",         "cve": "CVE-2022-37434", "severity": "CRITICAL",
+     "description": "Heap buffer over-read / over-write in inflate via extra field"},
+    {"package": "libc6",          "cve": "CVE-2022-23219", "severity": "CRITICAL",
+     "description": "Buffer overflow in glibc clnt_create via long pathname"},
+    {"package": "nss",            "cve": "CVE-2023-0767", "severity": "HIGH",
+     "description": "Arbitrary memory write via PKCS 12 import in NSS"},
+]
+
+NVD_PKG_QUERIES = [
+    "openssh", "openssl", "sudo", "bash", "curl", "wget",
+    "glibc", "polkit", "vim", "git", "python", "zlib",
+]
+
+def _nvd_query(keyword):
+    try:
+        url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={keyword}&resultsPerPage=5"
+        r = http_requests.get(url, timeout=2)
+        if r.status_code == 200:
+            data = r.json()
+            results = []
+            for item in data.get("vulnerabilities", []):
+                cve = item.get("cve", {})
+                cve_id = cve.get("id", "")
+                metrics = cve.get("metrics", {})
+                sev = "MEDIUM"
+                for key in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
+                    m = metrics.get(key, [])
+                    if m:
+                        sev = m[0].get("cvssData", {}).get("baseSeverity", "MEDIUM")
+                        break
+                desc = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "")
+                results.append({"cve": cve_id, "severity": sev.upper(),
+                                 "description": desc[:120], "source": "NVD-live"})
+            return results
+    except Exception:
+        pass
+    return None
+
 def vuln_scan():
-    vulns = []
     try:
         r = subprocess.run(["dpkg", "-l"], capture_output=True, text=True, timeout=10)
-        packages = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("ii")]
-        known_vuln_pkgs = {
-            "openssl": ("CVE-2022-0778", "HIGH"),
-            "openssh-server": ("CVE-2023-38408", "CRITICAL"),
-            "sudo": ("CVE-2021-3156", "HIGH"),
-            "bash": ("CVE-2014-6271", "CRITICAL"),
-            "curl": ("CVE-2023-23914", "MEDIUM"),
-            "wget": ("CVE-2021-31879", "MEDIUM"),
-        }
-        for pkg in packages:
-            base = pkg.split(":")[0]
-            if base in known_vuln_pkgs:
-                cve, sev = known_vuln_pkgs[base]
-                vulns.append({"package": base, "cve": cve, "severity": sev,
-                               "description": f"Known vulnerability in {base}"})
-    except Exception as e:
-        vulns.append({"package": "scan_error", "cve": "N/A", "severity": "INFO",
-                      "description": str(e)})
+        installed_pkgs = {l.split()[1].split(":")[0].lower()
+                          for l in r.stdout.splitlines() if l.startswith("ii")}
+    except Exception:
+        installed_pkgs = set()
+
+    vulns = []
+    seen_cve = set()
+
+    # Try NVD live for key packages
+    for kw in NVD_PKG_QUERIES:
+        if any(kw in p for p in installed_pkgs):
+            live = _nvd_query(kw)
+            if live:
+                for v in live[:2]:
+                    if v["cve"] not in seen_cve:
+                        seen_cve.add(v["cve"])
+                        vulns.append({"package": kw, **v})
+
+    # Fill with offline baseline for installed packages
+    for entry in NVD_OFFLINE:
+        pkg = entry["package"].split(":")[0].lower()
+        if entry["cve"] not in seen_cve and (pkg in installed_pkgs or not installed_pkgs):
+            seen_cve.add(entry["cve"])
+            vulns.append({**entry, "source": "offline"})
+
+    # Sort by severity
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    vulns.sort(key=lambda v: sev_order.get(v.get("severity", "INFO"), 4))
     return vulns
 
-# Active Response
+# ─── Compliance scoring from real SCA results ────────────────────────────────
+def compute_compliance(checks):
+    frameworks = {
+        "PCI-DSS": {"pass": 0, "fail": 0, "crit_fail": 0},
+        "HIPAA":   {"pass": 0, "fail": 0, "crit_fail": 0},
+        "NIST":    {"pass": 0, "fail": 0, "crit_fail": 0},
+    }
+    for c in checks:
+        tags = c.get("tags", "")
+        for fw in frameworks:
+            if fw in tags:
+                if c["status"] == "PASS":
+                    frameworks[fw]["pass"] += 1
+                else:
+                    frameworks[fw]["fail"] += 1
+                    if c["severity"] in ("CRITICAL", "HIGH"):
+                        frameworks[fw]["crit_fail"] += 1
+
+    result = {}
+    for fw, d in frameworks.items():
+        total = d["pass"] + d["fail"]
+        if total == 0:
+            result[fw] = {"score": 0, "pass": 0, "fail": 0, "status": "NON-COMPLIANT"}
+            continue
+        raw = d["pass"] / total * 100
+        penalty = d["crit_fail"] * 5
+        score = max(0, round(raw - penalty))
+        if score >= 80:
+            status = "COMPLIANT"
+        elif score >= 50:
+            status = "PARTIAL"
+        else:
+            status = "NON-COMPLIANT"
+        result[fw] = {"score": score, "pass": d["pass"], "fail": d["fail"],
+                       "crit_fail": d["crit_fail"], "status": status}
+    return result
+
+# ─── Active Response ─────────────────────────────────────────────────────────
 BLOCKED_IPS = set()
-KILLED_PIDS = set()
 
 def block_ip(ip):
     if ip in BLOCKED_IPS:
@@ -250,7 +577,25 @@ def unblock_ip(ip):
     except Exception as e:
         return True, f"Simulated unblock of {ip}"
 
-# Dashboard HTML
+# ─── Parser extension for new event types ───────────────────────────────────
+def _extend_event_type(event, line):
+    lower = line.lower()
+    if event["EventType"] == "SYS":
+        if any(x in lower for x in ["cron", "crond", "crontab", "periodic"]):
+            event["EventType"] = "CRON"
+        elif any(x in lower for x in ["apt", "dpkg", "yum", "dnf", "pip", "npm", "snap",
+                                       "install", "remove", "upgrade", "uninstall"]):
+            event["EventType"] = "PKG_MGMT"
+        elif any(x in lower for x in ["ifconfig", "ip addr", "ip route", "network",
+                                       "netplan", "nmcli", "interface up", "interface down",
+                                       "link up", "link down", "dhclient"]):
+            event["EventType"] = "NET_CHANGE"
+        elif any(x in lower for x in ["error", "critical", "panic", "segfault", "kernel oops",
+                                       "oom", "out of memory", "stack trace", "exception"]):
+            event["EventType"] = "SYS_ERROR"
+    return event
+
+# ─── Dashboard HTML ──────────────────────────────────────────────────────────
 DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -287,11 +632,11 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 /* NAV */
 nav{background:var(--surface);border-bottom:1px solid var(--border);height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:sticky;top:0;z-index:300}
 .brand{font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;color:var(--accent);border:1px solid var(--accent);padding:3px 10px;border-radius:3px;letter-spacing:.1em}
-.nav-center{display:flex;align-items:center;gap:4px}
+.nav-center{display:flex;align-items:center;gap:4px;overflow-x:auto}
 .nav-tab{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:.06em;padding:5px 14px;border-radius:4px;border:1px solid transparent;background:none;color:var(--muted);cursor:pointer;transition:all .15s;white-space:nowrap}
 .nav-tab:hover{color:var(--text);border-color:var(--border2)}
 .nav-tab.active{color:var(--accent);border-color:var(--accent);background:rgba(0,212,170,.08)}
-.nav-right{display:flex;align-items:center;gap:12px}
+.nav-right{display:flex;align-items:center;gap:12px;flex-shrink:0}
 .live-badge{display:flex;align-items:center;gap:5px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--accent)}
 .live-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1.8s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
@@ -338,15 +683,16 @@ nav{background:var(--surface);border-bottom:1px solid var(--border);height:52px;
 .stat::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px}
 .stat.s-red::after{background:var(--red)}.stat.s-orange::after{background:var(--orange)}
 .stat.s-blue::after{background:var(--blue)}.stat.s-green::after{background:var(--green)}
-.stat.s-purple::after{background:var(--purple)}
+.stat.s-purple::after{background:var(--purple)}.stat.s-cyan::after{background:var(--cyan)}
 .stat-lbl{font-size:10px;color:var(--muted);margin-bottom:5px;letter-spacing:.04em}
 .stat-val{font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600;line-height:1}
 .c-red{color:var(--red)}.c-orange{color:var(--orange)}.c-blue{color:var(--blue)}
 .c-green{color:var(--green)}.c-purple{color:var(--purple)}.c-cyan{color:var(--cyan)}
+.c-yellow{color:var(--yellow)}
 
 /* PANELS */
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:7px;margin-bottom:14px;overflow:hidden}
-.ph{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.ph{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
 .pt{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;letter-spacing:.1em;color:var(--muted);text-transform:uppercase}
 .pb{padding:16px}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
@@ -365,6 +711,8 @@ nav{background:var(--surface);border-bottom:1px solid var(--border);height:52px;
 .chip.co.active{background:rgba(227,160,58,.1);border-color:var(--orange);color:var(--orange)}
 .chip.cb.active{background:rgba(14,165,233,.1);border-color:var(--blue);color:var(--blue)}
 .chip.cp.active{background:rgba(188,140,255,.1);border-color:var(--purple);color:var(--purple)}
+.chip.cc.active{background:rgba(121,192,255,.1);border-color:var(--cyan);color:var(--cyan)}
+.chip.cy.active{background:rgba(210,153,34,.1);border-color:var(--yellow);color:var(--yellow)}
 table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
 thead{position:sticky;top:0;z-index:10}
 th{background:var(--panel);padding:8px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
@@ -375,7 +723,7 @@ tr.lr:hover td{background:rgba(255,255,255,.02)}
 tr.r-red td{background:rgba(248,81,73,.04)}tr.r-red:hover td{background:rgba(248,81,73,.08)}
 tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:rgba(227,160,58,.07)}
 .col-time{width:140px;color:var(--muted);white-space:nowrap}
-.col-type{width:120px}.col-host{width:110px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.col-type{width:130px}.col-host{width:110px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .col-user{width:90px;color:var(--blue);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .col-ip{width:110px;color:var(--accent);white-space:nowrap}
 .col-msg{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -386,6 +734,10 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 .badge-SUSPICIOUS_COMMAND{background:rgba(248,81,73,.2);color:#ff7070;border:1px solid rgba(248,81,73,.4)}
 .badge-BASH_HISTORY{background:rgba(188,140,255,.15);color:var(--purple);border:1px solid rgba(188,140,255,.3)}
 .badge-SYS{background:rgba(90,112,128,.15);color:var(--muted);border:1px solid rgba(90,112,128,.3)}
+.badge-CRON{background:rgba(121,192,255,.15);color:var(--cyan);border:1px solid rgba(121,192,255,.3)}
+.badge-PKG_MGMT{background:rgba(14,165,233,.15);color:var(--blue);border:1px solid rgba(14,165,233,.3)}
+.badge-NET_CHANGE{background:rgba(210,153,34,.15);color:var(--yellow);border:1px solid rgba(210,153,34,.3)}
+.badge-SYS_ERROR{background:rgba(227,160,58,.2);color:var(--orange);border:1px solid rgba(227,160,58,.4)}
 .sev-badge{display:inline-block;width:60px;text-align:center;padding:2px 0;border-radius:2px;font-size:9px;font-weight:600;letter-spacing:.06em}
 .sev-3{background:rgba(248,81,73,.2);color:var(--red)}.sev-2{background:rgba(227,160,58,.2);color:var(--orange)}
 .sev-1{background:rgba(210,153,34,.15);color:var(--yellow)}.sev-0{background:rgba(63,185,80,.1);color:var(--green)}
@@ -408,7 +760,8 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 .dv{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text);word-break:break-all}
 .dr{margin-top:10px;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);word-break:break-all;white-space:pre-wrap}
 .mitre-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.mitre-chip{font-family:'IBM Plex Mono',monospace;font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid rgba(14,165,233,.3);background:rgba(14,165,233,.08);color:var(--blue);cursor:help}
+.mitre-chip{font-family:'IBM Plex Mono',monospace;font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid rgba(14,165,233,.3);background:rgba(14,165,233,.08);color:var(--blue);cursor:pointer;text-decoration:none}
+.mitre-chip:hover{border-color:var(--blue);background:rgba(14,165,233,.15)}
 
 /* FORMS */
 .form-group{margin-bottom:12px}
@@ -424,6 +777,7 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 .btn.btn-red:hover{border-color:var(--red);background:rgba(248,81,73,.1)}
 .btn.btn-blue{border-color:rgba(14,165,233,.3);color:var(--blue);background:rgba(14,165,233,.06)}
 .btn.btn-blue:hover{background:rgba(14,165,233,.12)}
+.btn.btn-sm{padding:3px 9px;font-size:9px}
 
 /* TOAST */
 #toast{position:fixed;top:64px;right:20px;z-index:400;display:flex;flex-direction:column;gap:8px}
@@ -443,7 +797,7 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 .tag-low{background:rgba(63,185,80,.1);color:var(--green);border:1px solid rgba(63,185,80,.2)}
 .tag-info{background:rgba(90,112,128,.15);color:var(--muted);border:1px solid rgba(90,112,128,.3)}
 
-/* FIM / SCA / VULN specific */
+/* FIM / SCA / VULN */
 .fim-table,.sca-table,.vuln-table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
 .fim-table th,.sca-table th,.vuln-table th{background:var(--panel);padding:7px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
 .fim-table td,.sca-table td,.vuln-table td{padding:7px 12px;border-bottom:1px solid rgba(26,45,61,.5);vertical-align:middle}
@@ -451,7 +805,8 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 .progress-fill{height:100%;border-radius:2px;transition:width .4s ease}
 .chart-wrap{position:relative;height:160px}
 .mitre-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}
-.mitre-card{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:10px 12px}
+.mitre-card{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:10px 12px;cursor:pointer;transition:border-color .15s}
+.mitre-card:hover{border-color:var(--blue)}
 .mitre-id{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--blue)}
 .mitre-name{font-size:11px;color:var(--text);margin:3px 0}
 .mitre-tactic{font-size:9px;color:var(--muted)}
@@ -471,13 +826,25 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 .ip-table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
 .ip-table th{background:var(--panel);padding:7px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
 .ip-table td{padding:7px 12px;border-bottom:1px solid rgba(26,45,61,.5)}
+
+/* Compliance badges */
+.comp-card{background:var(--panel);border:1px solid var(--border);border-radius:7px;padding:18px;text-align:center}
+.comp-status{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;letter-spacing:.08em;padding:3px 10px;border-radius:3px;display:inline-block;margin-top:6px}
+.comp-status.COMPLIANT{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.comp-status.PARTIAL{background:rgba(210,153,34,.15);color:var(--yellow);border:1px solid rgba(210,153,34,.3)}
+.comp-status.NON-COMPLIANT{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}
+
+/* Process table */
+.proc-table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
+.proc-table th{background:var(--panel);padding:7px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+.proc-table td{padding:6px 12px;border-bottom:1px solid rgba(26,45,61,.5);vertical-align:middle}
 </style>
 </head>
 <body>
 
 <!-- NAV -->
 <nav>
-  <div class="nav-left" style="display:flex;align-items:center;gap:14px">
+  <div style="display:flex;align-items:center;gap:14px;flex-shrink:0">
     <span class="brand">SP-110</span>
     <span style="font-size:13px;font-weight:500;letter-spacing:.02em">Linux Behavior Monitor</span>
   </div>
@@ -516,9 +883,7 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
   </div>
   <div class="sb-section">
     <div class="sb-label">Active Alerts</div>
-    <div class="alert-stack" id="sb-alerts">
-      <div class="empty-state">No alerts</div>
-    </div>
+    <div class="alert-stack" id="sb-alerts"><div class="empty-state">No alerts</div></div>
   </div>
   <div class="sb-section">
     <div class="sb-label">Event Types</div>
@@ -593,6 +958,10 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
     <span class="chip cr" data-filter="SUSPICIOUS_COMMAND" onclick="setFilter(this,'SUSPICIOUS_COMMAND')">SUSPICIOUS</span>
     <span class="chip cp" data-filter="BASH_HISTORY" onclick="setFilter(this,'BASH_HISTORY')">BASH</span>
     <span class="chip cb" data-filter="SYS" onclick="setFilter(this,'SYS')">SYS</span>
+    <span class="chip cc" data-filter="CRON" onclick="setFilter(this,'CRON')">CRON</span>
+    <span class="chip cb" data-filter="PKG_MGMT" onclick="setFilter(this,'PKG_MGMT')">PKG_MGMT</span>
+    <span class="chip cy" data-filter="NET_CHANGE" onclick="setFilter(this,'NET_CHANGE')">NET_CHANGE</span>
+    <span class="chip co" data-filter="SYS_ERROR" onclick="setFilter(this,'SYS_ERROR')">SYS_ERROR</span>
     <span style="flex:1"></span>
     <span class="fl">Severity:</span>
     <span class="chip cr" data-sev="3" onclick="setSev(this,3)">CRITICAL</span>
@@ -670,10 +1039,11 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
   <div class="panel">
     <div class="ph">
       <span class="pt">File Integrity Monitoring</span>
-      <div style="display:flex;gap:8px;align-items:center">
-        <input class="form-input" id="fim-path-input" placeholder="/path/to/file" style="width:260px;font-size:11px;padding:5px 10px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input class="form-input" id="fim-path-input" placeholder="/path/to/file" style="width:240px;font-size:11px;padding:5px 10px">
         <button class="btn btn-accent" onclick="addFimPath()">+ Add Path</button>
         <button class="btn btn-blue" onclick="runFim()">▶ Run Scan</button>
+        <button class="btn" onclick="resetFimBaseline()" title="Clear baseline and re-establish">↺ Reset Baseline</button>
       </div>
     </div>
     <div class="pb">
@@ -682,7 +1052,7 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
         <thead><tr><th>File Path</th><th>SHA-256</th><th>Size</th><th>Modified</th><th>Status</th></tr></thead>
         <tbody id="fim-results"></tbody>
       </table>
-      <div id="fim-empty" class="empty-state" style="display:none">No scan results. Add paths and run scan.</div>
+      <div id="fim-empty" class="empty-state">No scan results. Add paths and run scan.</div>
     </div>
   </div>
   <div class="panel">
@@ -691,13 +1061,13 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
       <div class="grid-3">
         <div class="stat s-green"><div class="stat-lbl">Files Unchanged</div><div class="stat-val c-green" id="fim-ok">0</div></div>
         <div class="stat s-orange"><div class="stat-lbl">Files Modified</div><div class="stat-val c-orange" id="fim-mod">0</div></div>
-        <div class="stat s-red"><div class="stat-lbl">Files Missing</div><div class="stat-val c-red" id="fim-miss">0</div></div>
+        <div class="stat s-red"><div class="stat-lbl">Files Missing/Error</div><div class="stat-val c-red" id="fim-miss">0</div></div>
       </div>
     </div>
   </div>
 </div>
 
-<!-- CONFIG AUDIT -->
+<!-- CONFIG AUDIT (SCA) -->
 <div class="page" id="page-sca">
   <div class="stats-row" style="grid-template-columns:repeat(4,1fr)">
     <div class="stat s-green"><div class="stat-lbl">Checks Passed</div><div class="stat-val c-green" id="sca-pass">—</div></div>
@@ -707,8 +1077,16 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
   </div>
   <div class="panel">
     <div class="ph">
-      <span class="pt">Security Configuration Assessment</span>
-      <button class="btn btn-accent" onclick="runSca()">▶ Run Checks</button>
+      <span class="pt">CIS Benchmark — 32 Security Checks</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select class="form-select" id="sca-filter" style="width:160px;padding:5px 10px;font-size:10px" onchange="filterSca()">
+          <option value="ALL">All Checks</option>
+          <option value="FAIL">Failures Only</option>
+          <option value="PASS">Passed Only</option>
+          <option value="CRITICAL">Critical Only</option>
+        </select>
+        <button class="btn btn-accent" onclick="runSca()">▶ Run Checks</button>
+      </div>
     </div>
     <div class="pb">
       <div id="sca-progress" style="display:none;margin-bottom:12px">
@@ -716,30 +1094,33 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
         <div class="progress-bar"><div class="progress-fill" id="sca-pb" style="width:0%;background:var(--accent)"></div></div>
       </div>
       <table class="sca-table">
-        <thead><tr><th>Check ID</th><th>Description</th><th>Severity</th><th>Result</th></tr></thead>
+        <thead><tr><th>Check ID</th><th>Description</th><th>Framework Tags</th><th>Severity</th><th>Result</th></tr></thead>
         <tbody id="sca-results"></tbody>
       </table>
-      <div id="sca-empty" class="empty-state">Click "Run Checks" to assess security configuration</div>
+      <div id="sca-empty" class="empty-state">Click "Run Checks" to assess security configuration against 32 CIS Benchmark controls</div>
     </div>
   </div>
 </div>
 
-<!-- VULNERABILITIES-->
+<!-- VULNERABILITIES -->
 <div class="page" id="page-vuln">
   <div class="stats-row" style="grid-template-columns:repeat(4,1fr)">
     <div class="stat s-red"><div class="stat-lbl">Critical CVEs</div><div class="stat-val c-red" id="vn-crit">—</div></div>
     <div class="stat s-orange"><div class="stat-lbl">High CVEs</div><div class="stat-val c-orange" id="vn-high">—</div></div>
     <div class="stat s-blue"><div class="stat-lbl">Medium CVEs</div><div class="stat-val c-blue" id="vn-med">—</div></div>
-    <div class="stat s-green"><div class="stat-lbl">Total Scanned Pkgs</div><div class="stat-val" id="vn-total">—</div></div>
+    <div class="stat s-green"><div class="stat-lbl">Total Findings</div><div class="stat-val" id="vn-total">—</div></div>
   </div>
   <div class="panel">
     <div class="ph">
       <span class="pt">Vulnerability Detection</span>
-      <button class="btn btn-accent" onclick="runVuln()">▶ Scan Packages</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="vuln-source-badge" style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted)"></span>
+        <button class="btn btn-accent" onclick="runVuln()">▶ Scan Packages</button>
+      </div>
     </div>
     <div class="pb">
       <table class="vuln-table">
-        <thead><tr><th>Package</th><th>CVE ID</th><th>Severity</th><th>Description</th><th>Action</th></tr></thead>
+        <thead><tr><th>Package</th><th>CVE ID</th><th>Severity</th><th>Description</th><th>Source</th><th>Reference</th></tr></thead>
         <tbody id="vuln-results"></tbody>
       </table>
       <div id="vuln-empty" class="empty-state">Click "Scan Packages" to check for known vulnerabilities</div>
@@ -750,8 +1131,9 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
 <!-- MITRE ATT&CK -->
 <div class="page" id="page-mitre">
   <div class="panel">
-    <div class="ph"><span class="pt">MITRE ATT&CK Technique Correlations</span>
-      <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)">Based on live log data</span>
+    <div class="ph">
+      <span class="pt">MITRE ATT&CK v15 — Technique Correlations</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)">Based on live log data · Click cards to open ATT&CK</span>
     </div>
     <div class="pb">
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px" id="mitre-tactics"></div>
@@ -763,7 +1145,7 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
     <div class="pb">
       <div class="grid-2">
         <div>
-          <div class="pb" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:8px">DETECTED TACTICS</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:8px">DETECTED TACTICS</div>
           <div id="mitre-tactic-list" style="display:flex;flex-direction:column;gap:6px"></div>
         </div>
         <div><div class="chart-wrap"><canvas id="mitre-chart"></canvas></div></div>
@@ -808,11 +1190,11 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
         <div style="display:flex;flex-direction:column;gap:10px">
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
             <input type="checkbox" id="ar-auto-brute" checked style="accent-color:var(--accent)">
-            Auto-block IPs with >10 failed logins
+            Auto-block IPs with &gt;10 failed logins
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
             <input type="checkbox" id="ar-auto-sudo" style="accent-color:var(--accent)">
-            Alert on sudo abuse (>5 events)
+            Alert on sudo abuse (&gt;5 events)
           </label>
           <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
             <input type="checkbox" id="ar-auto-susp" checked style="accent-color:var(--accent)">
@@ -834,6 +1216,20 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
         <tbody id="ar-blocked-list"></tbody>
       </table>
       <div id="ar-blocked-empty" class="empty-state">No blocked IPs</div>
+    </div>
+  </div>
+  <!-- Process Manager -->
+  <div class="panel">
+    <div class="ph">
+      <span class="pt">Process Manager</span>
+      <button class="btn btn-blue" onclick="loadProcesses()">↺ Refresh</button>
+    </div>
+    <div class="pb" style="max-height:280px;overflow-y:auto">
+      <table class="proc-table">
+        <thead><tr><th>PID</th><th>User</th><th>CPU%</th><th>MEM%</th><th>Command</th><th>Action</th></tr></thead>
+        <tbody id="proc-table-body"></tbody>
+      </table>
+      <div id="proc-empty" class="empty-state">Click Refresh to load running processes</div>
     </div>
   </div>
   <div class="panel">
@@ -888,9 +1284,7 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
   <div class="grid-2">
     <div class="panel">
       <div class="ph"><span class="pt">System Inventory</span></div>
-      <div class="pb" id="sys-inv">
-        <div class="empty-state">Loading inventory…</div>
-      </div>
+      <div class="pb" id="sys-inv"><div class="empty-state">Loading inventory…</div></div>
     </div>
     <div class="panel">
       <div class="ph"><span class="pt">System Health</span></div>
@@ -902,15 +1296,52 @@ tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:r
       </div>
     </div>
   </div>
+  <!-- Compliance Panel -->
   <div class="panel">
-    <div class="ph"><span class="pt">Regulatory Compliance</span></div>
+    <div class="ph">
+      <span class="pt">Regulatory Compliance</span>
+      <button class="btn btn-accent" onclick="runComplianceCheck()">▶ Compute Scores</button>
+    </div>
     <div class="pb">
-      <div class="grid-3">
-        <div id="comp-pci" style="text-align:center;padding:14px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">PCI DSS</div><div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600" class="c-orange" id="comp-pci-val">—</div></div>
-        <div id="comp-hipaa" style="text-align:center;padding:14px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">HIPAA</div><div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600" class="c-orange" id="comp-hipaa-val">—</div></div>
-        <div id="comp-nist" style="text-align:center;padding:14px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">NIST CSF</div><div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600" class="c-orange" id="comp-nist-val">—</div></div>
+      <div class="grid-3" id="comp-grid">
+        <div class="comp-card">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">PCI-DSS</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:600;color:var(--orange)" id="comp-pci-val">—</div>
+          <div id="comp-pci-status"></div>
+          <div id="comp-pci-detail" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
+        </div>
+        <div class="comp-card">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">HIPAA</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:600;color:var(--orange)" id="comp-hipaa-val">—</div>
+          <div id="comp-hipaa-status"></div>
+          <div id="comp-hipaa-detail" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
+        </div>
+        <div class="comp-card">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">NIST CSF</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;font-weight:600;color:var(--orange)" id="comp-nist-val">—</div>
+          <div id="comp-nist-status"></div>
+          <div id="comp-nist-detail" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
+        </div>
       </div>
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">Run Security Configuration Assessment to compute compliance scores</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+        Scores computed from live SCA check results · Penalties applied for critical failures
+      </div>
+    </div>
+  </div>
+  <!-- CSV Import -->
+  <div class="panel">
+    <div class="ph"><span class="pt">CSV Import / Export</span></div>
+    <div class="pb">
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-accent" onclick="exportCSV()">⬇ Export CSV (last 5000 events)</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label class="btn btn-blue" style="cursor:pointer">
+            ⬆ Import CSV
+            <input type="file" id="csv-import-file" accept=".csv" style="display:none" onchange="importCSV(this)">
+          </label>
+          <span id="import-status" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)"></span>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -944,6 +1375,8 @@ let blockedIPs = {};
 let autoResponseCount = 0;
 let logPaths = {{ log_paths|tojson }};
 let allDbs = [];
+let scaChecksCache = [];
+let scaFilter = 'ALL';
 
 // INIT
 document.addEventListener('DOMContentLoaded', () => {
@@ -956,6 +1389,7 @@ document.addEventListener('DOMContentLoaded', () => {
   loadInventory();
   loadHealth();
   buildMitreMatrix();
+  renderFimPaths();
 });
 
 function updateClock() {
@@ -973,50 +1407,39 @@ function showPage(name, el) {
   el.classList.add('active');
   if (name === 'analytics') buildAnalytics();
   if (name === 'mitre') buildMitreMatrix();
+  if (name === 'admin') { loadDbs(); loadInventory(); loadHealth(); }
 }
 
-//  FETCH STATS
+// FETCH STATS
 async function fetchStats() {
   try {
     const r = await fetch('/api/stats');
     if (!r.ok) return;
     const d = await r.json();
-
-    // sidebar KPIs
     setNum('s-failed', d.failed_logins);
     setNum('s-brute',  d.brute_total);
     setNum('s-sudo',   d.sudo_total);
     setNum('s-ips',    d.unique_ips);
     setNum('s-total',  d.total_logs);
     setNum('s-susp',   d.suspicious_count);
-
-    // overview KPIs
     setNum('ov-failed', d.failed_logins);
     setNum('ov-auth',   d.auth_count);
     setNum('ov-susp',   d.suspicious_count);
     setNum('ov-hosts',  d.host_count);
-
-    // sidebar alerts
     renderSidebarAlerts(d.top_ips, d.sudo_users);
     renderEtypes(d.event_types);
     renderHosts(d.logs);
     renderSidebarBlocked();
-
-    // charts
     buildTimelineChart(d.logs);
     buildEtypeChart(d.event_types);
     buildIPChart(d.top_ips);
     buildSevChart(d.logs);
-
-    // log table
     allLogs = d.logs || [];
     if (document.getElementById('page-logs').classList.contains('active') ||
         document.getElementById('page-overview').classList.contains('active')) {
       applyFilters();
     }
     renderOverviewTable(allLogs);
-
-    // auto-response
     checkAutoResponse(d);
   } catch(e) { console.error(e); }
 }
@@ -1076,14 +1499,9 @@ function renderSidebarBlocked() {
 
 function typeFilterClick(name) {
   activeTypeFilter = activeTypeFilter === name ? null : name;
-  if (activeTypeFilter) {
-    activeFilter = activeTypeFilter;
-    showPage('logs', document.querySelector('.nav-tab:nth-child(2)'));
-    applyFilters();
-  } else {
-    activeFilter = 'ALL';
-    applyFilters();
-  }
+  activeFilter = activeTypeFilter || 'ALL';
+  showPage('logs', document.querySelectorAll('.nav-tab')[1]);
+  applyFilters();
 }
 
 // OVERVIEW TABLE
@@ -1124,14 +1542,13 @@ function renderLogTable() {
   const tb = document.getElementById('log-table');
   const start = (curPage-1)*pageSize, end = start+pageSize;
   const page = filteredLogs.slice(start, end);
-  if (!page.length) { tb.innerHTML = '<tr><td colspan="7" class="empty-state">No events match filters</td></tr>'; }
+  if (!page.length) tb.innerHTML = '<tr><td colspan="7" class="empty-state">No events match filters</td></tr>';
   else tb.innerHTML = page.map(l => rowHtml(l)).join('');
   renderPagination();
 }
 
 function rowHtml(l) {
   const rc = l.threat_level>=3 ? 'r-red' : l.threat_level>=2 ? 'r-orange' : '';
-  const sevCls = `sev-badge sev-${l.threat_level}`;
   return `<tr class="lr ${rc}" onclick='openDrawer(${JSON.stringify(l)})'>
     <td class="col-time">${l.timestamp}</td>
     <td class="col-type"><span class="badge badge-${l.eventtype}">${l.eventtype}</span></td>
@@ -1139,7 +1556,7 @@ function rowHtml(l) {
     <td class="col-user">${l.username}</td>
     <td class="col-ip">${l.sourceip}</td>
     <td class="col-msg" title="${escHtml(l.message)}">${escHtml(l.message)}</td>
-    <td class="col-sev"><span class="${sevCls}">${l.threat_label}</span></td>
+    <td class="col-sev"><span class="sev-badge sev-${l.threat_level}">${l.threat_label}</span></td>
   </tr>`;
 }
 
@@ -1151,8 +1568,7 @@ function renderPagination() {
   document.getElementById('pg-info').textContent = `Showing ${total?start:0}–${end} of ${total}`;
   const c = document.getElementById('pg-btns');
   let html = `<button class="pg-btn" onclick="changePage(${curPage-1})" ${curPage<=1?'disabled':''}>‹ Prev</button>`;
-  const range = pageRange(curPage, pages);
-  range.forEach(p => {
+  pageRange(curPage, pages).forEach(p => {
     if (p==='…') html += `<button class="pg-btn" disabled>…</button>`;
     else html += `<button class="pg-btn ${p===curPage?'cur':''}" onclick="changePage(${p})">${p}</button>`;
   });
@@ -1194,14 +1610,16 @@ function openDrawer(l) {
   const mitre = {{ mitre_map|tojson }};
   const techniques = mitre[l.eventtype] || [];
   document.getElementById('drawer-mitre').innerHTML = techniques.length
-    ? techniques.map(t => `<span class="mitre-chip" title="${t.tactic}">${t.id} — ${t.name}</span>`).join('')
+    ? techniques.map(t =>
+        `<a class="mitre-chip" href="https://attack.mitre.org/techniques/${t.id.replace('.','/')}/" target="_blank" title="${t.tactic}">${t.id} — ${t.name}</a>`
+      ).join('')
     : '<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;color:var(--muted)">No MITRE mapping</span>';
   document.getElementById('drawer').classList.add('open');
 }
 function closeDrawer() { document.getElementById('drawer').classList.remove('open'); }
 
 // CHARTS
-const CC = { grid:'rgba(26,45,61,.6)', text:'#5a7080', accent:'#00d4aa', red:'#f85149', orange:'#e3a03a', blue:'#0ea5e9', purple:'#bc8cff', green:'#3fb950' };
+const CC = { grid:'rgba(26,45,61,.6)', text:'#5a7080', accent:'#00d4aa', red:'#f85149', orange:'#e3a03a', blue:'#0ea5e9', purple:'#bc8cff', green:'#3fb950', cyan:'#79c0ff', yellow:'#d29922' };
 
 function mkChart(id, cfg) {
   if (charts[id]) charts[id].destroy();
@@ -1272,35 +1690,24 @@ async function buildAnalytics() {
     setNum('an-susp',      d.suspicious_count);
     setNum('an-sudo-count', d.sudo_total);
 
-    // IP table
-    const ipTb = document.getElementById('an-ip-table');
     const ipResp = await fetch('/api/top-ips');
     const ips = await ipResp.json();
-    ipTb.innerHTML = (ips||[]).map(([ip,count]) =>
+    document.getElementById('an-ip-table').innerHTML = (ips||[]).map(([ip,count]) =>
       `<tr><td style="color:var(--accent)">${ip}</td><td>${count}</td>
        <td><span class="tag ${count>20?'tag-crit':count>10?'tag-high':'tag-med'}">${count>20?'CRITICAL':count>10?'HIGH':'MEDIUM'}</span></td>
-       <td><button class="btn btn-red" style="font-size:9px;padding:3px 8px" onclick="quickBlock('${ip}')">Block</button></td></tr>`
+       <td><button class="btn btn-red btn-sm" onclick="quickBlock('${ip}')">Block</button></td></tr>`
     ).join('') || '<tr><td colspan="4" class="empty-state">No attacker IPs</td></tr>';
 
-    // Sudo table
     const sudoResp = await fetch('/api/sudo-users');
     const sudos = await sudoResp.json();
-    const sudoTb = document.getElementById('an-sudo-table');
-    sudoTb.innerHTML = (sudos||[]).map(([u,c]) =>
+    document.getElementById('an-sudo-table').innerHTML = (sudos||[]).map(([u,c]) =>
       `<tr><td style="color:var(--blue)">${u}</td><td>${c}</td>
        <td><span class="tag ${c>10?'tag-high':'tag-med'}">${c>10?'HIGH':'MEDIUM'}</span></td></tr>`
     ).join('') || '<tr><td colspan="3" class="empty-state">No sudo data</td></tr>';
 
-    // Timeline chart
-    buildTimelineChart(d.logs);
-    const tl = document.getElementById('an-chart-tl');
-    if (tl && charts['chart-timeline']) {
-      const existing = charts['an-chart-tl'];
-      if (existing) existing.destroy();
-      // reuse data
-    }
+    // Timeline (reuse data from stats)
+    buildAnTimelineChart(d.logs);
 
-    // Success/Fail chart
     const success = (d.logs||[]).filter(l=>l.threat_level===0).length;
     const failed  = (d.logs||[]).filter(l=>l.threat_level> 0).length;
     mkChart('an-chart-sf', { type:'pie', data:{
@@ -1308,38 +1715,57 @@ async function buildAnalytics() {
       datasets:[{ data:[success,failed], backgroundColor:[CC.green,'rgba(248,81,73,.7)'], borderWidth:0 }]
     }, options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'right', labels:{color:CC.text,font:{size:10},boxWidth:10} } } } });
 
-    // Heatmap
     const hm = new Array(24).fill(0);
     (d.logs||[]).forEach(l => { if(l.timestamp) { const h=parseInt(l.timestamp.slice(11,13)); if(!isNaN(h)) hm[h]++; } });
     const max = Math.max(...hm,1);
     document.getElementById('an-heatmap').innerHTML = hm.map((v,h) =>
-      `<div title="${h}:00 — ${v} events" style="flex:1;height:${Math.max(4,v/max*80)}px;background:${v>0?'rgba(0,212,170,'+(.2+.8*v/max)+')':'var(--border)'};border-radius:2px 2px 0 0;cursor:default"></div>`
+      `<div title="${h}:00 — ${v} events" style="flex:1;height:${Math.max(4,v/max*80)}px;background:${v>0?'rgba(0,212,170,'+(0.2+0.8*v/max)+')':'var(--border)'};border-radius:2px 2px 0 0;cursor:default"></div>`
     ).join('');
   } catch(e) { console.error(e); }
 }
 
+function buildAnTimelineChart(logs) {
+  const now = new Date(), buckets = {};
+  for (let i=59; i>=0; i--) {
+    const k = new Date(now - i*60000);
+    const label = k.toTimeString().slice(0,5);
+    buckets[label] = {label, failed:0};
+  }
+  (logs||[]).forEach(l => {
+    if (!l.timestamp) return;
+    const t = l.timestamp.slice(11,16);
+    if (buckets[t] && l.threat_level > 0) buckets[t].failed++;
+  });
+  const vals = Object.values(buckets);
+  mkChart('an-chart-tl', { type:'line', data:{
+    labels: vals.map(v=>v.label),
+    datasets:[{ label:'Failed Logins', data:vals.map(v=>v.failed), borderColor:CC.red, backgroundColor:'rgba(248,81,73,.1)', tension:.3, pointRadius:0, fill:true }]
+  }, options:chartOpts() });
+}
+
 // FIM
-let fimPaths = ['/etc/passwd','/etc/shadow','/etc/hosts','/etc/crontab'];
+let fimPaths = ['/etc/passwd','/etc/shadow','/etc/hosts','/etc/crontab','/etc/sudoers','/root/.bashrc'];
 let fimBaseline = {};
 
 function renderFimPaths() {
   document.getElementById('fim-paths').innerHTML = fimPaths.map((p,i) =>
     `<div class="path-item"><div style="display:flex;align-items:center;gap:8px"><div class="path-status"></div><span>${p}</span></div>
-     <button class="btn btn-red" style="font-size:9px;padding:2px 8px" onclick="removeFimPath(${i})">Remove</button></div>`
+     <button class="btn btn-red btn-sm" onclick="removeFimPath(${i})">Remove</button></div>`
   ).join('') || '<div style="color:var(--muted);font-size:10px">No paths configured</div>';
 }
 
 function addFimPath() {
   const v = document.getElementById('fim-path-input').value.trim();
   if (!v) return;
-  if (!fimPaths.includes(v)) { fimPaths.push(v); renderFimPaths(); toast('Path added', 'ok'); }
+  if (!fimPaths.includes(v)) { fimPaths.push(v); renderFimPaths(); toast('Path added','ok'); }
   document.getElementById('fim-path-input').value = '';
 }
 
 function removeFimPath(i) { fimPaths.splice(i,1); renderFimPaths(); }
+function resetFimBaseline() { fimBaseline = {}; toast('Baseline cleared — next scan will establish new baseline','info'); }
 
 async function runFim() {
-  toast('Running FIM scan…', 'info');
+  toast('Running FIM scan…','info');
   try {
     const r = await fetch('/api/fim', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({paths:fimPaths}) });
     const results = await r.json();
@@ -1360,12 +1786,10 @@ async function runFim() {
       </tr>`;
     }).join('');
     setNum('fim-ok',ok); setNum('fim-mod',mod); setNum('fim-miss',miss);
-    document.getElementById('fim-empty').style.display = 'none';
-    toast(`FIM scan complete: ${results.length} files`, 'ok');
-  } catch(e) { toast('FIM scan failed: '+e.message, 'err'); }
+    document.getElementById('fim-empty').style.display='none';
+    toast(`FIM scan complete: ${results.length} files checked`,'ok');
+  } catch(e) { toast('FIM scan failed: '+e.message,'err'); }
 }
-
-document.addEventListener('DOMContentLoaded', () => { renderFimPaths(); });
 
 // SCA
 async function runSca() {
@@ -1373,37 +1797,49 @@ async function runSca() {
   const pb   = document.getElementById('sca-pb');
   prog.style.display = 'block';
   let pct = 0;
-  const interval = setInterval(() => { pct = Math.min(pct+15,90); pb.style.width=pct+'%'; }, 300);
+  const interval = setInterval(() => { pct = Math.min(pct+8,90); pb.style.width=pct+'%'; }, 300);
   try {
     const r = await fetch('/api/sca');
-    const checks = await r.json();
+    scaChecksCache = await r.json();
     clearInterval(interval); pb.style.width='100%';
     setTimeout(() => prog.style.display='none', 600);
-    const pass = checks.filter(c=>c.status==='PASS').length;
-    const fail = checks.filter(c=>c.status==='FAIL').length;
-    const crit = checks.filter(c=>c.status==='FAIL'&&c.severity==='CRITICAL').length;
-    const score = Math.round(pass/(checks.length||1)*100);
-    document.getElementById('sca-pass').textContent  = pass;
-    document.getElementById('sca-fail').textContent  = fail;
-    document.getElementById('sca-score').textContent = score + '%';
-    document.getElementById('sca-crit').textContent  = crit;
-    // compliance scores
-    document.getElementById('comp-pci-val').textContent  = Math.max(0,score-10)+'%';
-    document.getElementById('comp-hipaa-val').textContent = score+'%';
-    document.getElementById('comp-nist-val').textContent  = Math.min(100,score+5)+'%';
-    document.getElementById('sca-empty').style.display = 'none';
-    const tb = document.getElementById('sca-results');
-    tb.innerHTML = checks.map(c => `<tr>
-      <td style="font-family:'IBM Plex Mono',monospace;color:var(--muted)">${c.id}</td>
-      <td>${c.title}${c.detail?'<div style="font-size:9px;color:var(--muted);margin-top:2px">'+c.detail+'</div>':''}</td>
-      <td><span class="tag ${c.severity==='CRITICAL'?'tag-crit':c.severity==='HIGH'?'tag-high':c.severity==='MEDIUM'?'tag-med':'tag-low'}">${c.severity}</span></td>
-      <td><span class="tag ${c.status==='PASS'?'tag-low':'tag-crit'}">${c.status}</span></td>
-    </tr>`).join('');
-    toast(`SCA complete: ${pass} pass, ${fail} fail`, pass>=fail?'ok':'err');
+    renderScaResults(scaChecksCache);
+    toast(`SCA complete: ${scaChecksCache.filter(c=>c.status==='PASS').length} pass, ${scaChecksCache.filter(c=>c.status==='FAIL').length} fail`,
+          scaChecksCache.filter(c=>c.status==='FAIL').length > scaChecksCache.filter(c=>c.status==='PASS').length ? 'err' : 'ok');
   } catch(e) { clearInterval(interval); prog.style.display='none'; toast('SCA failed: '+e.message,'err'); }
 }
 
-// VULN 
+function filterSca() {
+  scaFilter = document.getElementById('sca-filter').value;
+  if (scaChecksCache.length) renderScaResults(scaChecksCache);
+}
+
+function renderScaResults(checks) {
+  const pass = checks.filter(c=>c.status==='PASS').length;
+  const fail = checks.filter(c=>c.status==='FAIL').length;
+  const crit = checks.filter(c=>c.status==='FAIL'&&c.severity==='CRITICAL').length;
+  const score = Math.round(pass/(checks.length||1)*100);
+  document.getElementById('sca-pass').textContent  = pass;
+  document.getElementById('sca-fail').textContent  = fail;
+  document.getElementById('sca-score').textContent = score + '%';
+  document.getElementById('sca-crit').textContent  = crit;
+  document.getElementById('sca-empty').style.display = 'none';
+
+  let visible = checks;
+  if (scaFilter === 'FAIL') visible = checks.filter(c=>c.status==='FAIL');
+  else if (scaFilter === 'PASS') visible = checks.filter(c=>c.status==='PASS');
+  else if (scaFilter === 'CRITICAL') visible = checks.filter(c=>c.severity==='CRITICAL');
+
+  document.getElementById('sca-results').innerHTML = visible.map(c => `<tr>
+    <td style="font-family:'IBM Plex Mono',monospace;color:var(--muted);white-space:nowrap">${c.id}</td>
+    <td>${c.title}${c.detail?'<div style="font-size:9px;color:var(--muted);margin-top:2px">'+escHtml(c.detail)+'</div>':''}</td>
+    <td style="font-size:9px;color:var(--muted);font-family:'IBM Plex Mono',monospace;white-space:nowrap">${(c.tags||'').replace(/,/g,'<br>')}</td>
+    <td><span class="tag ${c.severity==='CRITICAL'?'tag-crit':c.severity==='HIGH'?'tag-high':c.severity==='MEDIUM'?'tag-med':'tag-low'}">${c.severity}</span></td>
+    <td><span class="tag ${c.status==='PASS'?'tag-low':'tag-crit'}">${c.status}</span></td>
+  </tr>`).join('');
+}
+
+// VULN
 async function runVuln() {
   toast('Scanning packages…','info');
   try {
@@ -1416,19 +1852,22 @@ async function runVuln() {
     document.getElementById('vn-high').textContent  = high;
     document.getElementById('vn-med').textContent   = med;
     document.getElementById('vn-total').textContent = vulns.length;
+    const liveCount = vulns.filter(v=>v.source==='NVD-live').length;
+    document.getElementById('vuln-source-badge').textContent =
+      liveCount > 0 ? `${liveCount} from NVD live · ${vulns.length-liveCount} offline` : 'offline baseline';
     document.getElementById('vuln-empty').style.display = 'none';
-    const tb = document.getElementById('vuln-results');
-    tb.innerHTML = vulns.length
+    document.getElementById('vuln-results').innerHTML = vulns.length
       ? vulns.map(v => `<tr>
           <td style="font-family:'IBM Plex Mono',monospace;color:var(--blue)">${v.package}</td>
           <td style="font-family:'IBM Plex Mono',monospace;color:var(--orange)">${v.cve}</td>
           <td><span class="tag ${v.severity==='CRITICAL'?'tag-crit':v.severity==='HIGH'?'tag-high':v.severity==='MEDIUM'?'tag-med':'tag-low'}">${v.severity}</span></td>
-          <td style="color:var(--muted)">${v.description}</td>
+          <td style="color:var(--muted);font-size:11px">${escHtml(v.description||'')}</td>
+          <td><span class="tag ${v.source==='NVD-live'?'tag-info':'tag-low'}" style="font-size:8px">${v.source||'offline'}</span></td>
           <td><a href="https://nvd.nist.gov/vuln/detail/${v.cve}" target="_blank" style="color:var(--blue);font-family:'IBM Plex Mono',monospace;font-size:10px">NVD ↗</a></td>
         </tr>`)
         .join('')
-      : '<tr><td colspan="5" class="empty-state" style="color:var(--green)">No known vulnerabilities detected</td></tr>';
-    toast(`Vuln scan complete: ${vulns.length} findings`, crit>0?'err':'ok');
+      : '<tr><td colspan="6" class="empty-state" style="color:var(--green)">No known vulnerabilities detected</td></tr>';
+    toast(`Vuln scan: ${vulns.length} findings (${crit} critical)`, crit>0?'err':'ok');
   } catch(e) { toast('Vuln scan failed: '+e.message,'err'); }
 }
 
@@ -1445,16 +1884,14 @@ function buildMitreMatrix() {
     });
   });
 
-  // tactic pills
   document.getElementById('mitre-tactics').innerHTML = Object.entries(tactics)
     .sort((a,b)=>b[1]-a[1])
     .map(([t,c]) => `<span class="mitre-chip" style="font-size:11px;padding:5px 12px">${t} <strong>${c}</strong></span>`)
     .join('') || '<span style="color:var(--muted);font-size:11px">Waiting for log data…</span>';
 
-  // technique cards
   document.getElementById('mitre-cards').innerHTML = Object.values(techniques)
     .sort((a,b)=>b.count-a.count)
-    .map(t => `<div class="mitre-card">
+    .map(t => `<div class="mitre-card" onclick="window.open('https://attack.mitre.org/techniques/${t.id.replace('.','/').replace('.','/') }/', '_blank')">
       <div class="mitre-id">${t.id}</div>
       <div class="mitre-name">${t.name}</div>
       <div class="mitre-tactic">${t.tactic}</div>
@@ -1462,7 +1899,6 @@ function buildMitreMatrix() {
     </div>`)
     .join('') || '<div class="empty-state" style="grid-column:1/-1">No MITRE techniques detected yet</div>';
 
-  // tactic list
   document.getElementById('mitre-tactic-list').innerHTML = Object.entries(tactics)
     .sort((a,b)=>b[1]-a[1])
     .map(([t,c]) => `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
@@ -1471,17 +1907,18 @@ function buildMitreMatrix() {
     </div>`)
     .join('') || '<div style="color:var(--muted);font-size:11px">No data</div>';
 
-  // radar chart
   const tacticNames = Object.keys(tactics);
   const tacticCounts = Object.values(tactics);
-  mkChart('mitre-chart', { type:'radar', data:{
-    labels: tacticNames,
-    datasets:[{ label:'Activity', data:tacticCounts,
-      backgroundColor:'rgba(0,212,170,.12)', borderColor:'rgba(0,212,170,.7)',
-      pointBackgroundColor:'var(--accent)', pointRadius:4 }]
-  }, options:{ responsive:true, maintainAspectRatio:false,
-    plugins:{ legend:{display:false} },
-    scales:{ r:{ grid:{color:CC.grid}, ticks:{display:false}, pointLabels:{color:CC.text,font:{size:9}} } } } });
+  if (tacticNames.length) {
+    mkChart('mitre-chart', { type:'radar', data:{
+      labels: tacticNames,
+      datasets:[{ label:'Activity', data:tacticCounts,
+        backgroundColor:'rgba(0,212,170,.12)', borderColor:'rgba(0,212,170,.7)',
+        pointBackgroundColor:'var(--accent)', pointRadius:4 }]
+    }, options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false} },
+      scales:{ r:{ grid:{color:CC.grid}, ticks:{display:false}, pointLabels:{color:CC.text,font:{size:9}} } } } });
+  }
 }
 
 // ACTIVE RESPONSE
@@ -1504,12 +1941,11 @@ async function blockIP() {
     const d = await r.json();
     if (d.success) {
       blockedIPs[ip] = { reason, time:new Date().toISOString() };
-      renderBlockedTable();
-      renderSidebarBlocked();
+      renderBlockedTable(); renderSidebarBlocked();
       setNum('ar-blocked-count', Object.keys(blockedIPs).length);
       arLogEntry(`Blocked IP ${ip} — ${reason}`, 'ok');
-      toast(`Blocked ${ip}`, 'ok');
-    } else { toast(d.message,'err'); }
+      toast(`Blocked ${ip}`,'ok');
+    } else toast(d.message,'err');
   } catch(e) { toast('Block failed: '+e.message,'err'); }
 }
 
@@ -1521,33 +1957,28 @@ async function unblockIP() {
 
 async function unblockIPDirect(ip) {
   try {
-    const r = await fetch('/api/unblock-ip', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip}) });
-    const d = await r.json();
+    await fetch('/api/unblock-ip', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip}) });
     delete blockedIPs[ip];
-    renderBlockedTable();
-    renderSidebarBlocked();
+    renderBlockedTable(); renderSidebarBlocked();
     setNum('ar-blocked-count', Object.keys(blockedIPs).length);
-    arLogEntry(`Unblocked IP ${ip}`, 'ok');
-    toast(`Unblocked ${ip}`, 'ok');
+    arLogEntry(`Unblocked IP ${ip}`,'ok');
+    toast(`Unblocked ${ip}`,'ok');
   } catch(e) { toast('Unblock failed: '+e.message,'err'); }
 }
 
-function quickBlock(ip) {
-  document.getElementById('ar-ip-input').value = ip;
-  blockIP();
-}
+function quickBlock(ip) { document.getElementById('ar-ip-input').value = ip; blockIP(); }
 
 function renderBlockedTable() {
   const c = document.getElementById('ar-blocked-list');
   const empty = document.getElementById('ar-blocked-empty');
   const entries = Object.entries(blockedIPs);
   if (!entries.length) { c.innerHTML=''; empty.style.display='block'; return; }
-  empty.style.display = 'none';
+  empty.style.display='none';
   c.innerHTML = entries.map(([ip,data]) =>
     `<tr><td style="color:var(--red);font-family:'IBM Plex Mono',monospace">${ip}</td>
      <td>${data.reason||'Manual'}</td>
      <td style="color:var(--muted)">${(data.time||'').slice(0,19)}</td>
-     <td><button class="btn" style="font-size:9px;padding:3px 8px" onclick="unblockIPDirect('${ip}')">Unblock</button></td></tr>`
+     <td><button class="btn btn-sm" onclick="unblockIPDirect('${ip}')">Unblock</button></td></tr>`
   ).join('');
 }
 
@@ -1559,9 +1990,8 @@ function checkAutoResponse(d) {
         autoResponseCount++;
         setNum('ar-auto', autoResponseCount);
         arLogEntry(`AUTO-BLOCK: ${ip} — ${count} failed logins`, 'err');
-        toast(`Auto-blocked ${ip} (brute force)`, 'err');
-        renderBlockedTable();
-        renderSidebarBlocked();
+        toast(`Auto-blocked ${ip} (brute force)`,'err');
+        renderBlockedTable(); renderSidebarBlocked();
         setNum('ar-blocked-count', Object.keys(blockedIPs).length);
       }
     });
@@ -1569,7 +1999,70 @@ function checkAutoResponse(d) {
   setNum('ar-brute', d.brute_total);
 }
 
-function saveAutoRules() { toast('Auto-response rules saved', 'ok'); }
+function saveAutoRules() { toast('Auto-response rules saved','ok'); }
+
+// PROCESS MANAGER
+async function loadProcesses() {
+  try {
+    const r = await fetch('/api/processes');
+    const procs = await r.json();
+    if (!procs.length) { document.getElementById('proc-empty').style.display='block'; return; }
+    document.getElementById('proc-empty').style.display='none';
+    document.getElementById('proc-table-body').innerHTML = procs.map(p =>
+      `<tr>
+        <td style="font-family:'IBM Plex Mono',monospace;color:var(--muted)">${p.pid}</td>
+        <td style="color:var(--blue)">${p.user}</td>
+        <td>${p.cpu}</td>
+        <td>${p.mem}</td>
+        <td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px" title="${escHtml(p.cmd)}">${escHtml(p.cmd)}</td>
+        <td><button class="btn btn-red btn-sm" onclick="killProcess(${p.pid},'${escHtml(p.cmd).slice(0,20)}')">Kill</button></td>
+      </tr>`
+    ).join('');
+    arLogEntry(`Process list refreshed: ${procs.length} processes`,'info');
+  } catch(e) { toast('Process load failed: '+e.message,'err'); }
+}
+
+async function killProcess(pid, name) {
+  if (!confirm(`Send SIGTERM to PID ${pid} (${name})?`)) return;
+  try {
+    const r = await fetch('/api/kill-process', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pid}) });
+    const d = await r.json();
+    if (d.success) { arLogEntry(`Killed PID ${pid} (${name})`,'ok'); toast(`SIGTERM sent to PID ${pid}`,'ok'); loadProcesses(); }
+    else toast(d.message,'err');
+  } catch(e) { toast('Kill failed: '+e.message,'err'); }
+}
+
+// COMPLIANCE
+async function runComplianceCheck() {
+  if (!scaChecksCache.length) {
+    toast('Run Security Config Assessment first (Config Audit tab)','err');
+    return;
+  }
+  try {
+    const r = await fetch('/api/compliance', { method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({checks: scaChecksCache}) });
+    const d = await r.json();
+    renderComplianceScores(d);
+    toast('Compliance scores updated','ok');
+  } catch(e) { toast('Compliance check failed: '+e.message,'err'); }
+}
+
+function renderComplianceScores(d) {
+  const fwMap = {'PCI-DSS': 'pci', 'HIPAA': 'hipaa', 'NIST': 'nist'};
+  for (const [fw, key] of Object.entries(fwMap)) {
+    const info = d[fw];
+    if (!info) continue;
+    const scoreEl = document.getElementById(`comp-${key}-val`);
+    const statusEl = document.getElementById(`comp-${key}-status`);
+    const detailEl = document.getElementById(`comp-${key}-detail`);
+    if (scoreEl) {
+      scoreEl.textContent = info.score + '%';
+      scoreEl.style.color = info.score>=80?'var(--green)':info.score>=50?'var(--yellow)':'var(--red)';
+    }
+    if (statusEl) statusEl.innerHTML = `<span class="comp-status ${info.status}">${info.status}</span>`;
+    if (detailEl) detailEl.textContent = `${info.pass} pass · ${info.fail} fail · ${info.crit_fail} critical fails`;
+  }
+}
 
 // ADMIN: DB Manager
 async function loadDbs() {
@@ -1599,7 +2092,7 @@ async function selectDb(name) {
   try {
     const r = await fetch('/api/switch-db', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({database:name}) });
     const d = await r.json();
-    if (d.success) { toast('Switched to '+name, 'ok'); loadDbs(); fetchStats(); }
+    if (d.success) { toast('Switched to '+name,'ok'); loadDbs(); fetchStats(); }
     else toast(d.message,'err');
   } catch(e) { toast('Switch failed: '+e.message,'err'); }
 }
@@ -1623,7 +2116,7 @@ function renderLogPaths() {
   document.getElementById('log-paths').innerHTML = logPaths.map((p,i) =>
     `<div class="path-item">
       <div style="display:flex;align-items:center;gap:8px"><div class="path-status"></div><span>${p}</span></div>
-      <button class="btn btn-red" style="font-size:9px;padding:2px 8px" onclick="removeLogPath(${i})">Remove</button>
+      <button class="btn btn-red btn-sm" onclick="removeLogPath(${i})">Remove</button>
     </div>`
   ).join('') || '<div style="color:var(--muted);font-size:10px">No paths configured</div>';
 }
@@ -1678,6 +2171,36 @@ async function loadHealth() {
   } catch(e) { document.getElementById('health-table').innerHTML='<tr><td colspan="2" class="empty-state">Health check failed</td></tr>'; }
 }
 
+// CSV IMPORT
+async function importCSV(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const statusEl = document.getElementById('import-status');
+  statusEl.textContent = 'Uploading…';
+  statusEl.style.color = 'var(--muted)';
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const r = await fetch('/import/csv', { method:'POST', body: formData });
+    const d = await r.json();
+    if (d.imported !== undefined) {
+      statusEl.textContent = `Imported ${d.imported} rows`;
+      statusEl.style.color = 'var(--green)';
+      toast(`CSV import: ${d.imported} rows added`,'ok');
+      fetchStats();
+    } else {
+      statusEl.textContent = d.error || 'Import failed';
+      statusEl.style.color = 'var(--red)';
+      toast('Import failed: '+(d.error||'unknown'),'err');
+    }
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    statusEl.style.color = 'var(--red)';
+    toast('Import error: '+e.message,'err');
+  }
+  input.value = '';
+}
+
 // UTILS
 function toast(msg, type='info') {
   const c = document.getElementById('toast');
@@ -1707,15 +2230,13 @@ async function confirmClear() {
 </html>
 """
 
-# Active DB switching
+# ─── Active DB / log paths ───────────────────────────────────────────────────
 _active_db = DB_CONFIG["database"]
-_log_paths  = list(DB_CONFIG.get("_log_paths", [])) or [
+_log_paths = list(DB_CONFIG.get("_log_paths", [])) or [
     "/var/log/auth.log", "/var/log/syslog", "/var/log/kern.log",
     "/var/log/dpkg.log", "/var/log/audit/audit.log",
     "/root/.bash_history"
 ]
-
-import sys, importlib
 
 def get_active_db():
     return _active_db
@@ -1725,15 +2246,15 @@ def get_active_db_conn():
     cfg["database"] = _active_db
     return psycopg2.connect(**cfg)
 
-# Routes
+# ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def dashboard():
     return render_template_string(
         DASHBOARD_HTML,
-        mitre_map   = MITRE_MAP,
-        log_paths   = _log_paths,
-        current_db  = _active_db,
+        mitre_map  = MITRE_MAP,
+        log_paths  = _log_paths,
+        current_db = _active_db,
     )
 
 @app.route("/api/stats", methods=["GET"])
@@ -1767,7 +2288,8 @@ def api_stats():
         host_count = cur.fetchone()[0] or 0
 
         cur.execute("SELECT EventType, COUNT(*) FROM Logs GROUP BY EventType ORDER BY COUNT(*) DESC")
-        event_types = [{"name": r[0] or "SYS", "count": r[1], "color": ETYPE_COLORS.get(r[0] or "SYS","var(--muted)")} for r in cur.fetchall()]
+        event_types = [{"name": r[0] or "SYS", "count": r[1],
+                         "color": ETYPE_COLORS.get(r[0] or "SYS", "var(--muted)")} for r in cur.fetchall()]
 
         cur.execute("""
             SELECT logid,COALESCE(EventTime,NOW()),Message,EventType,Success,UserName,SourceIp,RawLine,HostName
@@ -1811,7 +2333,7 @@ def api_top_ips():
         cur.execute("SELECT SourceIp,COUNT(*) FROM Logs WHERE Success=0 GROUP BY SourceIp ORDER BY COUNT(*) DESC LIMIT 20")
         rows = [[r[0],r[1]] for r in cur.fetchall()]
         cur.close(); conn.close(); return jsonify(rows)
-    except Exception as e: return jsonify([])
+    except Exception: return jsonify([])
 
 @app.route("/api/sudo-users")
 def api_sudo_users():
@@ -1820,7 +2342,7 @@ def api_sudo_users():
         cur.execute("SELECT UserName,COUNT(*) FROM Logs WHERE EventType='SUDO' GROUP BY UserName ORDER BY COUNT(*) DESC LIMIT 20")
         rows = [[r[0] or "unknown",r[1]] for r in cur.fetchall()]
         cur.close(); conn.close(); return jsonify(rows)
-    except Exception as e: return jsonify([])
+    except Exception: return jsonify([])
 
 @app.route("/api/fim", methods=["POST"])
 def api_fim():
@@ -1835,6 +2357,48 @@ def api_sca():
 @app.route("/api/vuln")
 def api_vuln():
     return jsonify(vuln_scan())
+
+@app.route("/api/compliance", methods=["POST"])
+def api_compliance():
+    data   = request.json or {}
+    checks = data.get("checks", [])
+    if not checks:
+        # run fresh if not provided
+        checks = run_sca()
+    result = compute_compliance(checks)
+    return jsonify(result)
+
+@app.route("/api/processes")
+def api_processes():
+    try:
+        r = subprocess.run(["ps", "aux", "--no-headers", "--sort=-%cpu"],
+                            capture_output=True, text=True, timeout=5)
+        procs = []
+        for line in r.stdout.splitlines()[:50]:
+            parts = line.split(None, 10)
+            if len(parts) >= 11:
+                procs.append({"user": parts[0], "pid": int(parts[1]),
+                               "cpu": parts[2], "mem": parts[3], "cmd": parts[10]})
+        return jsonify(procs)
+    except Exception as e:
+        return jsonify([])
+
+@app.route("/api/kill-process", methods=["POST"])
+def api_kill_process():
+    data = request.json or {}
+    pid  = data.get("pid")
+    if not pid:
+        return jsonify({"success": False, "message": "No PID provided"}), 400
+    try:
+        pid = int(pid)
+        if pid <= 1:
+            return jsonify({"success": False, "message": "Cannot kill system process"}), 400
+        subprocess.run(["kill", "-TERM", str(pid)], check=True, timeout=3)
+        return jsonify({"success": True, "message": f"SIGTERM sent to PID {pid}"})
+    except subprocess.CalledProcessError:
+        return jsonify({"success": False, "message": f"kill failed — process may not exist"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
 
 @app.route("/api/block-ip", methods=["POST"])
 def api_block_ip():
@@ -1924,13 +2488,15 @@ def ingest():
     if not data or data.get("api_key") != API_KEY:
         return jsonify({"error":"Invalid API key"}), 401
     raw_line = data.get("message","")
-    event    = parser.parse(raw_line)
+    event = parser.parse(raw_line, source_type=data.get("source_type", "SYS"))
     if not event:
         event = {"EventTime":datetime.utcnow().isoformat(),"EventType":"SYS","Success":1,
                  "UserName":None,"SourceIp":None,"Message":raw_line[:700],"RawLine":raw_line,
                  "HostName":data.get("host","unknown")}
     else:
         event["HostName"] = data.get("host","unknown")
+    # Apply extended event type detection
+    event = _extend_event_type(event, raw_line)
     try:
         cfg = DB_CONFIG.copy(); cfg["database"] = _active_db
         conn = psycopg2.connect(**cfg); cur = conn.cursor()
@@ -1967,6 +2533,35 @@ def export_csv():
                         headers={"Content-Disposition":f"attachment; filename=sp110_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"})
     except Exception as e: return jsonify({"error":str(e)}),500
 
+@app.route("/import/csv", methods=["POST"])
+def import_csv():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    f = request.files["file"]
+    try:
+        content = f.read().decode("utf-8", errors="ignore")
+        reader = csv.DictReader(io.StringIO(content))
+        conn = get_active_db_conn(); cur = conn.cursor()
+        count = 0
+        for row in reader:
+            # Map CSV columns flexibly
+            event_time  = row.get("eventtime") or row.get("EventTime") or row.get("timestamp") or None
+            event_type  = row.get("eventtype") or row.get("EventType") or "SYS"
+            success     = row.get("success") or row.get("Success") or 1
+            username    = row.get("username") or row.get("UserName") or None
+            hostname    = row.get("hostname") or row.get("HostName") or None
+            source_ip   = row.get("sourceip") or row.get("SourceIp") or None
+            message     = row.get("message") or row.get("Message") or ""
+            raw_line    = row.get("rawline") or row.get("RawLine") or message
+            cur.execute("""INSERT INTO Logs(EventTime,EventType,Success,UserName,HostName,SourceIp,Message,RawLine)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (event_time, event_type, success, username, hostname, source_ip, message[:700], raw_line))
+            count += 1
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"imported": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/clear-logs", methods=["POST"])
 def clear_logs():
     try:
@@ -1977,5 +2572,5 @@ def clear_logs():
     except Exception as e: return jsonify({"status":"error","message":str(e)}),500
 
 if __name__ == "__main__":
-    print(f"SP-110 Linux Behavior Monitor http://{SERVER_HOST}:{SERVER_PORT}")
+    print(f"SP-110 Linux Behavior Monitor  http://{SERVER_HOST}:{SERVER_PORT}")
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
