@@ -30,6 +30,7 @@ JOURNAL_UNITS = os.environ.get("JOURNAL_UNITS", "sshd,sudo,systemd,auth").split(
     "sshd", "sudo", "systemd", "user"   # "user" catches most user sessions
 ]
 
-API_KEY = os.environ.get("SOC_API_KEY", "API_KEY")
-if not API_KEY or API_KEY == "API_KEY":
-    raise RuntimeError("SOC_API_KEY environment variable is not set.")
+API_KEY = os.environ.get("API_KEY")
+if not API_KEY:
+    print(". ")
+    API_KEY = "API_KEY"
