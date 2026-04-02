@@ -68,18 +68,17 @@ MITRE_MAP = {
         {"id": "T1562",     "name": "Impair Defenses",                   "tactic": "Defense Evasion"},
     ],
 }
-
 # ─── Event-type colors ───────────────────────────────────────────────────────
 ETYPE_COLORS = {
-    "AUTH":               "var(--red)",
-    "SUDO":               "var(--orange)",
-    "SUSPICIOUS_COMMAND": "var(--red)",
-    "BASH_HISTORY":       "var(--purple)",
-    "SYS":                "var(--muted)",
-    "CRON":               "var(--cyan)",
-    "PKG_MGMT":           "var(--blue)",
-    "NET_CHANGE":         "var(--yellow)",
-    "SYS_ERROR":          "var(--orange)",
+    "AUTH":               "#f85149",      # red
+    "SUDO":               "#e3a03a",      # orange
+    "SUSPICIOUS_COMMAND": "#f85149",      # red
+    "BASH_HISTORY":       "#bc8cff",      # purple
+    "SYS":                "#5a7080",      # muted
+    "CRON":               "#79c0ff",      # cyan
+    "PKG_MGMT":           "#0ea5e9",      # blue
+    "NET_CHANGE":         "#d29922",      # yellow
+    "SYS_ERROR":          "#e3a03a",      # orange
 }
 
 # ─── Severity classifier ────────────────────────────────────────────────────
