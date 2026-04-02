@@ -1,45 +1,44 @@
+# You end up with a matrix like this:
+
+# [failed_ssh, accepted_ssh, sudo_count, unique_ips, total_events, hour]
+# [0,          0,            1,          1,           3,            19]
+# [0,          0,            0,          0,           1,            19]
+# [2,          0,            0,          2,           2,            19]
+# [0,          1,            0,          1,           1,            19]
+# Each row = one time window
+# Each column = one feature
+
 """
-auth_log_iforest_demo.py
 
 Purpose:
     A simple end-to-end proof of concept for Linux log anomaly detection
     using /var/log/auth.log and an Isolation Forest.
 
 What this script does:
-    1. Watches auth.log in real time
+    1. Watches auth.log in near real time
     2. Groups new log lines into fixed time windows
     3. Converts each window into simple numeric features
     4. Collects a short "normal behavior" baseline
     5. Trains an Isolation Forest on that baseline
     6. Monitors future windows and flags unusual behavior
-
-Good for:
-    - quick MVP testing
-    - showing the full pipeline works
-    - demonstrating how logs become ML input
-
+    7. Prints a verdict for every window, including a human-readable severity
 
 How to test it:
     - Let it sit during baseline collection while the system is mostly idle
+    - During baseline, do a small amount of normal activity:
+        * 1-2 sudo commands
+        * some normal terminal usage
     - After training, generate unusual auth activity such as:
         * several sudo commands in a short burst
         * failed SSH logins (if SSH is enabled)
-    - Watch the script print anomaly scores for each window
+    - Watch the script print the verdict, anomaly score, and severity
 
-Example sudo burst test:
-    sudo ls /root
-    sudo journalctl -n 5 >/dev/null
-    sudo ls /var/log >/dev/null
-    sudo cat /etc/shadow >/dev/null 2>&1
 
-Optional SSH failed-login test (if localhost SSH is enabled):
-    ssh fakeuser@localhost
-
-Important note:
-    Isolation Forest in this script has a fixed learning phase first,
-    then a monitoring phase after that. It does not keep retraining itself.
+Important note about severity:
+    Isolation Forest does NOT output a true probability or confidence 0-100%.
+    This script creates a pseudo-severity value from the anomaly score so the
+    output is easier for humans to understand in a demo.
 """
-
 import os
 import re
 import time
@@ -51,89 +50,47 @@ import joblib
 # Configuration
 # -----------------------------
 
-# Path to the Linux auth log.
-# On Ubuntu/Kubuntu this is usually /var/log/auth.log
 AUTH_LOG = "/var/log/auth.log"
-
-# Number of seconds to group into one "behavior window".
-# Shorter windows = faster feedback, but noisier data.
-# Longer windows = more stable summaries, but slower demo.
 WINDOW_SECONDS = 20
-
-# Number of windows to collect before training.
-# These windows should ideally represent mostly normal behavior.
 BASELINE_WINDOWS = 8
-
-# Where the trained model will be saved.
 MODEL_PATH = "auth_iforest.joblib"
-
-# Isolation Forest setting:
-# contamination is the model's guess for roughly how much anomaly-like
-# data might exist. Smaller = less sensitive. Larger = more sensitive.
 CONTAMINATION = 0.10
+
+USE_MANUAL_SCORE_THRESHOLD = False
+MANUAL_SCORE_THRESHOLD = -0.10
 
 
 # -----------------------------
 # Regex patterns
 # -----------------------------
-# These are simple patterns to detect useful auth.log events.
-# They are not perfect, but good enough for a proof of concept.
-
-# Example failed SSH line:
-# "Failed password for invalid user bob from 192.168.1.5 port 22 ssh2"
 failed_ssh_re = re.compile(
     r"Failed password for (invalid user )?(\S+) from (\d+\.\d+\.\d+\.\d+)"
 )
 
-# Example accepted SSH line:
-# "Accepted password for colin from 192.168.1.5 port 22 ssh2"
 accepted_ssh_re = re.compile(
     r"Accepted \S+ for (\S+) from (\d+\.\d+\.\d+\.\d+)"
 )
 
-# Sudo lines often include "sudo:"
 sudo_re = re.compile(r"sudo:")
-
-# A very loose user extractor used for some sudo-style lines
 user_re = re.compile(r"for (\S+)")
-
-# General IP extractor for "from x.x.x.x"
 ip_re = re.compile(r"from (\d+\.\d+\.\d+\.\d+)")
 
 
 # -----------------------------
-# tail_f
+# open_log_at_end
 # -----------------------------
-# This works similarly to "tail -f" in Linux.
-# It opens the file, jumps to the end, and then waits for new lines.
-#
-# Why do this?
-# Because for live monitoring, we want only NEW log activity, not
-# the entire old log history every time.
-def tail_f(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        # Seek to end so we start watching new events only.
-        f.seek(0, os.SEEK_END)
-
-        while True:
-            line = f.readline()
-
-            # If no line is available yet, wait a bit and try again.
-            if not line:
-                time.sleep(0.2)
-                continue
-
-            yield line.strip()
+# Opens the auth log and seeks to the end of the file.
+# This means the script starts watching only NEW log entries.
+def open_log_at_end(path):
+    f = open(path, "r", encoding="utf-8", errors="ignore")
+    f.seek(0, os.SEEK_END)
+    return f
 
 
 # -----------------------------
 # extract_features
 # -----------------------------
 # Converts raw log lines from a single time window into a numeric feature vector.
-#
-# This is the most important ML step conceptually:
-# raw logs are NOT fed directly into Isolation Forest.
-# Instead, we summarize behavior into counts and simple metrics.
 #
 # Current features:
 #   0 = failed SSH count
@@ -143,9 +100,6 @@ def tail_f(path):
 #   4 = unique user count
 #   5 = total auth-related lines seen
 #   6 = current hour of day
-#
-# Why these?
-# They are simple, easy to explain, and often useful for anomaly detection.
 def extract_features(lines):
     failed_ssh_count = 0
     accepted_ssh_count = 0
@@ -154,28 +108,24 @@ def extract_features(lines):
     unique_users = set()
 
     for line in lines:
-        # Count failed SSH logins
         failed_match = failed_ssh_re.search(line)
         if failed_match:
             failed_ssh_count += 1
             unique_users.add(failed_match.group(2))
             unique_ips.add(failed_match.group(3))
 
-        # Count successful SSH logins
         accepted_match = accepted_ssh_re.search(line)
         if accepted_match:
             accepted_ssh_count += 1
             unique_users.add(accepted_match.group(1))
             unique_ips.add(accepted_match.group(2))
 
-        # Count sudo events
         if sudo_re.search(line):
             sudo_count += 1
             maybe_user = user_re.search(line)
             if maybe_user:
                 unique_users.add(maybe_user.group(1))
 
-        # Catch any IP that appears in a "from x.x.x.x" format
         maybe_ip = ip_re.search(line)
         if maybe_ip:
             unique_ips.add(maybe_ip.group(1))
@@ -197,23 +147,21 @@ def extract_features(lines):
 # -----------------------------
 # collect_window
 # -----------------------------
-# Collects all new log lines that arrive during one fixed time window.
+# Collects all new log lines that appear during one fixed time window.
 #
-# Example:
-# If WINDOW_SECONDS = 20, this function gathers all auth.log activity
-# that appears during those 20 seconds, then returns it as a list.
-#
-# That list is later converted into a single feature vector.
-def collect_window(line_gen, seconds):
+# This version is time-based and does NOT block forever waiting for new lines.
+# If no line is ready, it sleeps briefly and checks again.
+def collect_window(log_file, seconds):
     start = time.time()
     lines = []
 
     while time.time() - start < seconds:
-        try:
-            line = next(line_gen)
-            lines.append(line)
-        except StopIteration:
-            break
+        line = log_file.readline()
+
+        if line:
+            lines.append(line.strip())
+        else:
+            time.sleep(0.2)
 
     return lines
 
@@ -223,15 +171,7 @@ def collect_window(line_gen, seconds):
 # -----------------------------
 # Trains an Isolation Forest using baseline feature rows.
 #
-# baseline_rows should look like:
-# [
-#   [0, 0, 1, 0, 1, 2, 19],
-#   [0, 0, 0, 0, 0, 0, 19],
-#   [1, 0, 0, 1, 1, 1, 19],
-#   ...
-# ]
-#
-# Each inner list is one time window summarized as features.
+# Each inner list in baseline_rows is one time window summarized as features.
 def train_model(baseline_rows):
     model = IsolationForest(
         n_estimators=100,
@@ -246,7 +186,6 @@ def train_model(baseline_rows):
 # describe_features
 # -----------------------------
 # Turns the numeric feature vector into a labeled dictionary for cleaner output.
-# This is purely for readability during the demo.
 def describe_features(feats):
     return {
         "failed_ssh_count": feats[0],
@@ -260,34 +199,202 @@ def describe_features(feats):
 
 
 # -----------------------------
-# main
+# compute_severity_percent
 # -----------------------------
-# High-level flow:
-#   1. Watch auth.log
-#   2. Collect baseline windows
-#   3. Train model
-#   4. Save model
-#   5. Monitor forever and score live windows
-def main():
-    print("Starting auth.log Isolation Forest demo...")
+# Isolation Forest does not give a true probability/confidence.
+# So this function maps the raw anomaly score into a human-readable
+# 0-100 severity percentage for demo purposes.
+def compute_severity_percent(score):
+    raw = -score * 200.0
+    clamped = max(0.0, min(100.0, raw))
+    return int(round(clamped))
+
+
+# -----------------------------
+# severity_label
+# -----------------------------
+# Converts the pseudo-severity percent into a word label.
+def severity_label(percent):
+    if percent == 0:
+        return "none"
+    if percent < 25:
+        return "low"
+    if percent < 50:
+        return "moderate"
+    if percent < 75:
+        return "high"
+    return "critical"
+
+
+# -----------------------------
+# determine_verdict
+# -----------------------------
+# Uses the model's built-in prediction by default.
+# Optionally, you can also enforce a manual score threshold.
+def determine_verdict(pred, score):
+    model_says_anomaly = (pred == -1)
+
+    if USE_MANUAL_SCORE_THRESHOLD:
+        manual_says_anomaly = (score < MANUAL_SCORE_THRESHOLD)
+        is_anomaly = model_says_anomaly or manual_says_anomaly
+    else:
+        is_anomaly = model_says_anomaly
+
+    verdict = "ANOMALY DETECTED" if is_anomaly else "NORMAL"
+    return verdict, is_anomaly
+
+
+# -----------------------------
+# get_preset_baseline_rows
+# -----------------------------
+# Returns a fake but more varied "normal-ish" baseline dataset.
+# This is useful for testing the ML flow when live data is too sparse.
+#
+# Feature order:
+# [failed_ssh, accepted_ssh, sudo_count, unique_ip_count, unique_user_count, total_auth_events, hour_of_day]
+def get_preset_baseline_rows():
+    rows = []
+
+    # Helper to add repeated rows
+    def add(row, n):
+        for _ in range(n):
+            rows.append(row.copy())
+
+    # -----------------------------
+    # HEAVY IDLE BASELINE (VERY IMPORTANT)
+    # -----------------------------
+    for hour in range(0, 24):
+        add([0, 0, 0, 0, 0, 0, hour], 6)
+
+    # -----------------------------
+    # LIGHT NORMAL ACTIVITY
+    # -----------------------------
+    for hour in range(0, 24):
+        add([0, 0, 1, 0, 1, 1, hour], 4)
+        add([0, 0, 2, 0, 1, 2, hour], 3)
+        add([0, 0, 3, 0, 1, 3, hour], 2)
+
+    # -----------------------------
+    # MODERATE NORMAL ACTIVITY
+    # -----------------------------
+    for hour in range(8, 20):
+        add([0, 0, 4, 0, 1, 4, hour], 2)
+        add([0, 0, 5, 0, 1, 5, hour], 2)
+        add([0, 0, 6, 0, 1, 6, hour], 1)
+
+    # -----------------------------
+    # SSH ACTIVITY MIX (NORMAL)
+    # -----------------------------
+    for hour in range(8, 20):
+        add([0, 1, 0, 1, 1, 1, hour], 3)
+        add([0, 1, 1, 1, 1, 2, hour], 2)
+        add([1, 0, 0, 1, 1, 1, hour], 2)  # occasional failed login
+
+    # -----------------------------
+    # MIXED EVENTS (REALISTIC NORMAL)
+    # -----------------------------
+    for hour in range(9, 18):
+        add([0, 1, 2, 1, 1, 3, hour], 2)
+        add([1, 1, 1, 2, 2, 3, hour], 1)
+        add([0, 1, 3, 1, 1, 4, hour], 1)
+
+    # -----------------------------
+    # SLIGHTLY BUSY BUT STILL NORMAL
+    # -----------------------------
+    for hour in range(10, 16):
+        add([0, 0, 6, 0, 1, 6, hour], 1)
+        add([0, 0, 7, 0, 1, 7, hour], 1)
+        add([0, 1, 4, 1, 1, 5, hour], 1)
+
+    # -----------------------------
+    # RANDOMIZED SMALL VARIATION (IMPORTANT)
+    # -----------------------------
+    import random
+
+    for _ in range(200):
+        hour = random.randint(0, 23)
+
+        sudo = random.choice([0, 1, 2, 3, 4])
+        accepted = random.choice([0, 0, 1])
+        failed = random.choice([0, 0, 0, 1])
+
+        unique_users = 1 if (sudo + accepted + failed) > 0 else 0
+        unique_ips = 1 if (accepted or failed) else 0
+        total = sudo + accepted + failed
+
+        rows.append([
+            failed,
+            accepted,
+            sudo,
+            unique_ips,
+            unique_users,
+            total,
+            hour
+        ])
+
+    return rows
+
+
+# -----------------------------
+# print_feature_reference
+# -----------------------------
+# Shows the user what each index in the matrix means.
+def print_feature_reference():
+    print("Feature order used by the model:")
+    print("  [0] failed_ssh_count")
+    print("  [1] accepted_ssh_count")
+    print("  [2] sudo_count")
+    print("  [3] unique_ip_count")
+    print("  [4] unique_user_count")
+    print("  [5] total_auth_events")
+    print("  [6] hour_of_day")
+    print()
+
+
+# -----------------------------
+# choose_baseline_mode
+# -----------------------------
+# Small text UI shown at startup so the user can choose whether to:
+#   1. Collect live training data from auth.log
+#   2. Use a preset baseline matrix
+def choose_baseline_mode():
+    print("==============================================")
+    print(" auth.log Isolation Forest Demo")
+    print("==============================================")
+    print()
+    print("Choose how to build the baseline training data:")
+    print("  1) Collect live auth.log baseline data")
+    print("  2) Use preset baseline matrix for quick testing")
+    print()
+
+    while True:
+        choice = input("Enter choice (1 or 2): ").strip()
+        if choice in {"1", "2"}:
+            return choice
+        print("Invalid choice. Please enter 1 or 2.")
+        print()
+
+
+# -----------------------------
+# collect_live_baseline_rows
+# -----------------------------
+# Uses real auth.log windows to build the baseline.
+def collect_live_baseline_rows():
+    print()
+    print("Live baseline mode selected.")
     print(f"Watching: {AUTH_LOG}")
     print(f"Window size: {WINDOW_SECONDS} seconds")
     print(f"Baseline windows: {BASELINE_WINDOWS}")
     print()
+    print("Recommendation: do a small amount of normal activity during baseline.")
+    print("Example: 1-2 sudo commands, normal terminal usage, no obvious bursts.")
+    print()
 
-    # Create a live line generator for auth.log
-    gen = tail_f(AUTH_LOG)
-
-    # -----------------------------
-    # Phase 1: Baseline collection
-    # -----------------------------
-    # During this phase, the script is "learning" normal behavior.
-    # It does not score anomalies yet.
-    print("Phase 1: collecting baseline windows under normal behavior")
+    log_file = open_log_at_end(AUTH_LOG)
     baseline_rows = []
 
     for i in range(BASELINE_WINDOWS):
-        lines = collect_window(gen, WINDOW_SECONDS)
+        lines = collect_window(log_file, WINDOW_SECONDS)
         feats = extract_features(lines)
         baseline_rows.append(feats)
 
@@ -296,55 +403,90 @@ def main():
         print(f"  features: {describe_features(feats)}")
         print()
 
-    # -----------------------------
-    # Phase 2: Train model
-    # -----------------------------
+    return baseline_rows
+
+
+# -----------------------------
+# use_preset_baseline_rows
+# -----------------------------
+# Loads the fake default dataset and prints it for transparency.
+def use_preset_baseline_rows():
+    print()
+    print("Preset baseline mode selected.")
+    print("Using a built-in baseline matrix with more varied normal-ish activity.")
+    print("This is useful when live auth.log activity is too sparse for testing.")
+    print()
+
+    baseline_rows = get_preset_baseline_rows()
+    print_feature_reference()
+    print("Preset baseline rows:")
+    for i, row in enumerate(baseline_rows, start=1):
+        print(f"  row {i:02d}: {row}")
+    print()
+
+    return baseline_rows
+
+
+# -----------------------------
+# run_live_monitoring
+# -----------------------------
+# After training, this watches auth.log and prints the verdict for each window.
+def run_live_monitoring(model):
+    print("Live monitoring started.")
+    print(f"Watching: {AUTH_LOG}")
+    print(f"Window size: {WINDOW_SECONDS} seconds")
+    print("Now generate suspicious auth activity and watch the verdict, score, and severity.")
+    print("Press Ctrl+C to stop.")
+    print()
+
+    log_file = open_log_at_end(AUTH_LOG)
+
+    while True:
+        lines = collect_window(log_file, WINDOW_SECONDS)
+        feats = extract_features(lines)
+
+        pred = model.predict([feats])[0]
+        score = model.decision_function([feats])[0]
+
+        verdict, is_anomaly = determine_verdict(pred, score)
+        severity_percent = compute_severity_percent(score)
+        severity_text = severity_label(severity_percent)
+
+        print(f"[{datetime.now().isoformat()}]")
+        print(f"  verdict: {verdict}")
+        print(f"  model_prediction: {pred}   (1 = normal, -1 = anomaly)")
+        print(f"  anomaly_score: {score:.4f}")
+        print(f"  severity: {severity_percent}% ({severity_text})")
+        print(f"  features: {describe_features(feats)}")
+        print(f"  raw lines collected this window: {len(lines)}")
+        print()
+
+
+# -----------------------------
+# main
+# -----------------------------
+# High-level flow:
+#   1. Show startup text UI
+#   2. Collect or load baseline rows
+#   3. Train model
+#   4. Save model
+#   5. Start live monitoring
+def main():
+    choice = choose_baseline_mode()
+
+    if choice == "1":
+        baseline_rows = collect_live_baseline_rows()
+    else:
+        baseline_rows = use_preset_baseline_rows()
+
     print("Training Isolation Forest on baseline data...")
     model = train_model(baseline_rows)
     joblib.dump(model, MODEL_PATH)
 
     print(f"Model trained and saved to: {MODEL_PATH}")
     print()
-    print("Phase 2: live monitoring started")
-    print("Now generate suspicious auth activity and watch the scores.")
-    print("Press Ctrl+C to stop.")
-    print()
 
-    # -----------------------------
-    # Phase 3: Live monitoring
-    # -----------------------------
-    # For each new window:
-    #   - collect new auth.log lines
-    #   - convert them into features
-    #   - ask the model whether they look normal or anomalous
-    while True:
-        lines = collect_window(gen, WINDOW_SECONDS)
-        feats = extract_features(lines)
-
-        # predict:
-        #   1  = normal
-        #  -1  = anomaly
-        pred = model.predict([feats])[0]
-
-        # decision_function:
-        # higher = more normal
-        # lower  = more anomalous
-        score = model.decision_function([feats])[0]
-
-        status = "ANOMALY" if pred == -1 else "normal"
-
-        print(f"[{datetime.now().isoformat()}]")
-        print(f"  status: {status}")
-        print(f"  score: {score:.4f}")
-        print(f"  features: {describe_features(feats)}")
-        print(f"  raw lines collected this window: {len(lines)}")
-        print()
-
-        # Tutorial note:
-        # If you later want alerts, this is the place to add them.
-        # Example:
-        # if pred == -1:
-        #     send_email_alert(status, score, feats)
+    run_live_monitoring(model)
 
 
 if __name__ == "__main__":
