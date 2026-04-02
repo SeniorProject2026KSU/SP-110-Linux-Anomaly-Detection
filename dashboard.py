@@ -13,7 +13,7 @@ if "detection_results" not in st.session_state:
     st.session_state.detection_results = None
 
 
-# === Sidebar Navigation ===
+# Sidebar Navigation
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to:", [
     "Overview",

@@ -18,7 +18,7 @@ def create_database():
         if not cur.fetchone():
             print(f"Creating database '{db_name}'...")
             cur.execute(f'CREATE DATABASE "{db_name}"')
-            print(f"✓ Database '{db_name}' created successfully.")
+            print(f"Database '{db_name}' created successfully.")
         else:
             print(f"Database '{db_name}' already exists.")
 
@@ -75,9 +75,8 @@ def create_tables():
 
 
 if __name__ == "__main__":
-    print("=" * 65)
     print("   Linux Behavior Monitor (SP-110) - Database Setup")
-    print("=" * 65)
+
 
     success = create_database() and create_tables()
 

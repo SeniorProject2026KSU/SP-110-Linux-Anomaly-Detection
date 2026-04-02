@@ -57,9 +57,8 @@ def setup_database():
 
 
 def main():
-    print("=" * 65)
+
     print("   Linux Behavior Monitor (SP-110) Launcher")
-    print("=" * 65)
 
     check_postgres()
     if not setup_database():
@@ -78,7 +77,7 @@ def main():
     processes.append(agent)
 
     print("\nSystem is now running!")
-    print("   Dashboard → http://localhost:5000")
+    print("   Dashboard  http://localhost:5000")
     print("   Press CTRL+C to stop all processes\n")
 
     def shutdown(sig=None, frame=None):

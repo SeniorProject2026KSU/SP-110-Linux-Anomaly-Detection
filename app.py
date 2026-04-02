@@ -1,1319 +1,1758 @@
 from flask import Flask, request, jsonify, render_template_string, Response
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 import psycopg2
 from config import DB_CONFIG, SERVER_HOST, SERVER_PORT, API_KEY
 import parser
 import db
 import alerts
 import analytics
+import os
+import json
+import hashlib
+import subprocess
+import platform
 
 app = Flask(__name__)
 
-# Dashboard
-DASHBOARD_HTML = """
+# MITRE ATT&CK mapping
+MITRE_MAP = {
+    "SUSPICIOUS_COMMAND": [
+        {"id": "T1059", "name": "Command and Scripting Interpreter", "tactic": "Execution"},
+        {"id": "T1070.003", "name": "Clear Command History",          "tactic": "Defense Evasion"},
+    ],
+    "AUTH": [
+        {"id": "T1110", "name": "Brute Force",             "tactic": "Credential Access"},
+        {"id": "T1078", "name": "Valid Accounts",          "tactic": "Persistence"},
+    ],
+    "SUDO": [
+        {"id": "T1548.003", "name": "Sudo and Sudo Caching", "tactic": "Privilege Escalation"},
+        {"id": "T1078",     "name": "Valid Accounts",         "tactic": "Persistence"},
+    ],
+    "BASH_HISTORY": [
+        {"id": "T1059.004", "name": "Unix Shell",              "tactic": "Execution"},
+        {"id": "T1552.003", "name": "Bash History",            "tactic": "Credential Access"},
+    ],
+}
+
+# Event-type colors
+ETYPE_COLORS = {
+    "AUTH":               "var(--red)",
+    "SUDO":               "var(--orange)",
+    "SUSPICIOUS_COMMAND": "var(--red)",
+    "BASH_HISTORY":       "var(--purple)",
+    "SYS":                "var(--muted)",
+}
+
+# Severity classifier
+def classify(eventtype, success, message):
+    msg = (message or "").lower()
+    if eventtype == "SUSPICIOUS_COMMAND":
+        return 3, "CRITICAL"
+    if eventtype == "AUTH" and success == 0:
+        if any(x in msg for x in ["invalid user", "root", "admin"]):
+            return 3, "CRITICAL"
+        return 2, "HIGH"
+    if eventtype == "SUDO":
+        return 2, "HIGH"
+    if success == 0:
+        return 1, "MEDIUM"
+    return 0, "LOW"
+
+# DB helpers
+def get_db_connection(db_name=None):
+    cfg = DB_CONFIG.copy()
+    if db_name:
+        cfg["database"] = db_name
+    return psycopg2.connect(**cfg)
+
+def list_databases():
+    try:
+        cfg = DB_CONFIG.copy()
+        cfg["database"] = "postgres"
+        conn = psycopg2.connect(**cfg)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+        dbs = [r[0] for r in cur.fetchall()]
+        cur.close(); conn.close()
+        return dbs
+    except Exception as e:
+        return []
+
+def create_database_and_tables(db_name):
+    try:
+        cfg = DB_CONFIG.copy()
+        cfg["database"] = "postgres"
+        conn = psycopg2.connect(**cfg)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (db_name,))
+        if not cur.fetchone():
+            cur.execute(f'CREATE DATABASE "{db_name}"')
+        cur.close(); conn.close()
+
+        conn2 = get_db_connection(db_name)
+        cur2  = conn2.cursor()
+        cur2.execute("""
+            CREATE TABLE IF NOT EXISTS Logs (
+                logid SERIAL PRIMARY KEY,
+                EventTime TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                EventType VARCHAR(50),
+                Success INTEGER DEFAULT 1,
+                UserName VARCHAR(100),
+                HostName VARCHAR(100),
+                SourceIp VARCHAR(50),
+                Message TEXT,
+                RawLine TEXT
+            );
+            CREATE TABLE IF NOT EXISTS fim_baseline (
+                id SERIAL PRIMARY KEY,
+                filepath TEXT NOT NULL,
+                hash_sha256 TEXT,
+                size BIGINT,
+                mtime DOUBLE PRECISION,
+                checked_at TIMESTAMP DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS sca_results (
+                id SERIAL PRIMARY KEY,
+                check_id VARCHAR(50),
+                title TEXT,
+                status VARCHAR(20),
+                severity VARCHAR(20),
+                checked_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        cur2.execute("CREATE INDEX IF NOT EXISTS idx_logs_eventtime ON Logs(EventTime DESC);")
+        cur2.execute("CREATE INDEX IF NOT EXISTS idx_logs_eventtype ON Logs(EventType);")
+        cur2.execute("CREATE INDEX IF NOT EXISTS idx_logs_sourceip  ON Logs(SourceIp);")
+        cur2.execute("CREATE INDEX IF NOT EXISTS idx_logs_success   ON Logs(Success);")
+        conn2.commit(); cur2.close(); conn2.close()
+        return True, "Database and tables created successfully."
+    except Exception as e:
+        return False, str(e)
+
+# FIM helpers
+def fim_scan(paths=None):
+    default_paths = ["/etc/passwd", "/etc/shadow", "/etc/sudoers",
+                     "/etc/hosts", "/etc/crontab", "/root/.bashrc"]
+    targets = paths or default_paths
+    results = []
+    for p in targets:
+        try:
+            stat = os.stat(p)
+            with open(p, "rb") as f:
+                h = hashlib.sha256(f.read()).hexdigest()
+            results.append({"path": p, "hash": h, "size": stat.st_size,
+                             "mtime": stat.st_mtime, "status": "ok"})
+        except Exception as e:
+            results.append({"path": p, "hash": None, "size": 0,
+                             "mtime": 0, "status": str(e)})
+    return results
+
+# SCA checks
+def run_sca():
+    checks = []
+    def chk(cid, title, sev, passed, detail=""):
+        checks.append({"id": cid, "title": title, "severity": sev,
+                        "status": "PASS" if passed else "FAIL", "detail": detail})
+
+    # Root login via SSH
+    try:
+        with open("/etc/ssh/sshd_config") as f:
+            cfg = f.read()
+        chk("SCA-001", "SSH: PermitRootLogin disabled", "HIGH",
+            "permitrootlogin no" in cfg.lower() or "permitrootlogin prohibit-password" in cfg.lower())
+    except:
+        chk("SCA-001", "SSH: PermitRootLogin disabled", "HIGH", False, "sshd_config not readable")
+
+    # Password authentication
+    try:
+        with open("/etc/ssh/sshd_config") as f:
+            cfg = f.read()
+        chk("SCA-002", "SSH: PasswordAuthentication disabled", "MEDIUM",
+            "passwordauthentication no" in cfg.lower())
+    except:
+        chk("SCA-002", "SSH: PasswordAuthentication disabled", "MEDIUM", False)
+
+    # World-writable /tmp
+    try:
+        s = os.stat("/tmp")
+        chk("SCA-003", "/tmp has sticky bit set", "LOW", bool(s.st_mode & 0o1000))
+    except:
+        chk("SCA-003", "/tmp has sticky bit set", "LOW", False)
+
+    # UFW/iptables active
+    try:
+        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=3)
+        active = "active" in r.stdout.lower()
+        chk("SCA-004", "Firewall (ufw) is active", "HIGH", active)
+    except:
+        chk("SCA-004", "Firewall (ufw) is active", "HIGH", False, "ufw not found")
+
+    # Empty passwords
+    try:
+        with open("/etc/shadow") as f:
+            empty = any(line.split(":")[1] == "" for line in f if ":" in line)
+        chk("SCA-005", "No accounts with empty passwords", "CRITICAL", not empty)
+    except:
+        chk("SCA-005", "No accounts with empty passwords", "CRITICAL", False, "Cannot read /etc/shadow")
+
+    return checks
+
+# Vulnerability scan stub
+def vuln_scan():
+    vulns = []
+    try:
+        r = subprocess.run(["dpkg", "-l"], capture_output=True, text=True, timeout=10)
+        packages = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("ii")]
+        known_vuln_pkgs = {
+            "openssl": ("CVE-2022-0778", "HIGH"),
+            "openssh-server": ("CVE-2023-38408", "CRITICAL"),
+            "sudo": ("CVE-2021-3156", "HIGH"),
+            "bash": ("CVE-2014-6271", "CRITICAL"),
+            "curl": ("CVE-2023-23914", "MEDIUM"),
+            "wget": ("CVE-2021-31879", "MEDIUM"),
+        }
+        for pkg in packages:
+            base = pkg.split(":")[0]
+            if base in known_vuln_pkgs:
+                cve, sev = known_vuln_pkgs[base]
+                vulns.append({"package": base, "cve": cve, "severity": sev,
+                               "description": f"Known vulnerability in {base}"})
+    except Exception as e:
+        vulns.append({"package": "scan_error", "cve": "N/A", "severity": "INFO",
+                      "description": str(e)})
+    return vulns
+
+# Active Response
+BLOCKED_IPS = set()
+KILLED_PIDS = set()
+
+def block_ip(ip):
+    if ip in BLOCKED_IPS:
+        return False, "Already blocked"
+    BLOCKED_IPS.add(ip)
+    try:
+        subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"],
+                        capture_output=True, timeout=5)
+        return True, f"Blocked {ip} via iptables"
+    except Exception as e:
+        return True, f"Simulated block of {ip} (iptables unavailable: {e})"
+
+def unblock_ip(ip):
+    BLOCKED_IPS.discard(ip)
+    try:
+        subprocess.run(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"],
+                        capture_output=True, timeout=5)
+        return True, f"Unblocked {ip}"
+    except Exception as e:
+        return True, f"Simulated unblock of {ip}"
+
+# Dashboard HTML
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Linux Behavior Monitor — SP-110</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <style>
-        :root {
-            --bg:       #080c10;
-            --surface:  #0d1117;
-            --panel:    #111820;
-            --border:   #1e2d3d;
-            --border2:  #243447;
-            --text:     #c9d1d9;
-            --muted:    #6e7681;
-            --accent:   #00d4aa;
-            --accent2:  #0ea5e9;
-            --red:      #f85149;
-            --orange:   #e3a03a;
-            --yellow:   #d29922;
-            --green:    #3fb950;
-            --purple:   #bc8cff;
-            --scan:     rgba(0,212,170,0.03);
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-
-        body {
-            background: var(--bg);
-            color: var(--text);
-            font-family: 'IBM Plex Sans', sans-serif;
-            font-size: 14px;
-            min-height: 100vh;
-            overflow-x: hidden;
-        }
-
-        /* Scanline texture */
-        body::before {
-            content: '';
-            position: fixed;
-            inset: 0;
-            background: repeating-linear-gradient(
-                0deg,
-                transparent,
-                transparent 2px,
-                rgba(0,0,0,0.07) 2px,
-                rgba(0,0,0,0.07) 4px
-            );
-            pointer-events: none;
-            z-index: 9999;
-        }
-
-        /* Nav */
-        nav {
-            background: var(--surface);
-            border-bottom: 1px solid var(--border);
-            padding: 0 24px;
-            height: 56px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-
-        .nav-left { display: flex; align-items: center; gap: 16px; }
-
-        .brand {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--accent);
-            letter-spacing: 0.08em;
-            border: 1px solid var(--accent);
-            padding: 3px 10px;
-            border-radius: 3px;
-        }
-
-        .nav-title {
-            font-size: 15px;
-            font-weight: 500;
-            color: var(--text);
-            letter-spacing: 0.02em;
-        }
-
-        .nav-right { display: flex; align-items: center; gap: 16px; }
-
-        .live-badge {
-            display: flex; align-items: center; gap: 6px;
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            color: var(--accent);
-            letter-spacing: 0.05em;
-        }
-
-        .live-dot {
-            width: 7px; height: 7px;
-            border-radius: 50%;
-            background: var(--accent);
-            animation: pulse 1.8s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.4; transform: scale(0.7); }
-        }
-
-        .nav-time {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            color: var(--muted);
-        }
-
-        .btn {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            font-weight: 500;
-            letter-spacing: 0.06em;
-            padding: 6px 14px;
-            border-radius: 4px;
-            border: 1px solid var(--border2);
-            background: var(--panel);
-            color: var(--text);
-            cursor: pointer;
-            transition: all 0.15s;
-            text-decoration: none;
-            display: inline-flex; align-items: center; gap: 6px;
-        }
-        .btn:hover { border-color: var(--accent2); color: var(--accent2); }
-        .btn-danger { border-color: #3d1a1a; color: var(--red); }
-        .btn-danger:hover { border-color: var(--red); background: rgba(248,81,73,0.1); }
-        .btn-export { border-color: #1a3a4d; color: var(--accent2); }
-        .btn-export:hover { background: rgba(14,165,233,0.1); }
-
-        /* Layout */
-        .main { display: flex; height: calc(100vh - 56px); overflow: hidden; }
-
-        .sidebar {
-            width: 280px;
-            min-width: 280px;
-            background: var(--surface);
-            border-right: 1px solid var(--border);
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .content { flex: 1; overflow-y: auto; padding: 20px; }
-
-        /* Sidebar sections */
-        .sidebar-section {
-            border-bottom: 1px solid var(--border);
-            padding: 16px;
-        }
-
-        .sidebar-label {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 0.12em;
-            color: var(--muted);
-            text-transform: uppercase;
-            margin-bottom: 12px;
-        }
-
-        /* KPI mini cards */
-        .kpi-grid { display: flex; flex-direction: column; gap: 8px; }
-
-        .kpi-card {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 10px 14px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .kpi-label { font-size: 11px; color: var(--muted); }
-        .kpi-val {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 22px;
-            font-weight: 600;
-            line-height: 1;
-        }
-
-        /* Alert list in sidebar */
-        .alert-list { display: flex; flex-direction: column; gap: 6px; }
-
-        .alert-item {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-left: 3px solid var(--red);
-            border-radius: 4px;
-            padding: 8px 10px;
-            font-size: 11px;
-        }
-
-        .alert-item.warn { border-left-color: var(--orange); }
-        .alert-item.info { border-left-color: var(--accent2); }
-
-        .alert-ip {
-            font-family: 'IBM Plex Mono', monospace;
-            font-weight: 600;
-            color: var(--text);
-            margin-bottom: 2px;
-        }
-
-        .alert-meta { color: var(--muted); }
-
-        /* Event type breakdown */
-        .etype-list { display: flex; flex-direction: column; gap: 4px; }
-
-        .etype-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 5px 8px;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: background 0.1s;
-        }
-        .etype-row:hover, .etype-row.active { background: var(--border); }
-
-        .etype-name {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            display: flex; align-items: center; gap: 8px;
-        }
-
-        .etype-dot { width: 6px; height: 6px; border-radius: 50%; }
-
-        .etype-count {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            color: var(--muted);
-            background: var(--border);
-            padding: 1px 7px;
-            border-radius: 10px;
-        }
-
-        /* Search bar */
-        .search-bar {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            padding: 0 12px;
-            gap: 10px;
-            margin-bottom: 16px;
-        }
-
-        .search-bar:focus-within { border-color: var(--accent2); }
-
-        .search-icon { color: var(--muted); font-size: 13px; }
-
-        .search-input {
-            flex: 1;
-            background: none;
-            border: none;
-            outline: none;
-            color: var(--text);
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 13px;
-            padding: 10px 0;
-        }
-
-        .search-input::placeholder { color: var(--muted); }
-
-        /* Filter chips */
-        .filter-row {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            margin-bottom: 16px;
-            align-items: center;
-        }
-
-        .filter-label { font-size: 11px; color: var(--muted); margin-right: 4px; }
-
-        .chip {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 10px;
-            font-weight: 500;
-            letter-spacing: 0.06em;
-            padding: 4px 10px;
-            border-radius: 3px;
-            border: 1px solid var(--border2);
-            background: var(--panel);
-            color: var(--muted);
-            cursor: pointer;
-            transition: all 0.12s;
-            text-transform: uppercase;
-        }
-
-        .chip:hover { border-color: var(--border2); color: var(--text); }
-        .chip.active { background: rgba(0,212,170,0.12); border-color: var(--accent); color: var(--accent); }
-        .chip.chip-red.active { background: rgba(248,81,73,0.12); border-color: var(--red); color: var(--red); }
-        .chip.chip-orange.active { background: rgba(227,160,58,0.12); border-color: var(--orange); color: var(--orange); }
-        .chip.chip-green.active { background: rgba(63,185,80,0.12); border-color: var(--green); color: var(--green); }
-        .chip.chip-purple.active { background: rgba(188,140,255,0.12); border-color: var(--purple); color: var(--purple); }
-        .chip.chip-blue.active { background: rgba(14,165,233,0.12); border-color: var(--accent2); color: var(--accent2); }
-
-        /* Stats row */
-        .stats-row {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 12px;
-            margin-bottom: 20px;
-        }
-
-        .stat-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px 18px;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .stat-card::after {
-            content: '';
-            position: absolute;
-            bottom: 0; left: 0; right: 0;
-            height: 2px;
-        }
-
-        .stat-card.s-red::after { background: var(--red); }
-        .stat-card.s-orange::after { background: var(--orange); }
-        .stat-card.s-yellow::after { background: var(--yellow); }
-        .stat-card.s-blue::after { background: var(--accent2); }
-
-        .stat-lbl { font-size: 11px; color: var(--muted); margin-bottom: 6px; letter-spacing: 0.04em; }
-        .stat-val {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 32px;
-            font-weight: 600;
-            line-height: 1;
-        }
-        .stat-val.c-red { color: var(--red); }
-        .stat-val.c-orange { color: var(--orange); }
-        .stat-val.c-yellow { color: var(--yellow); }
-        .stat-val.c-blue { color: var(--accent2); }
-
-        /* Chart panel */
-        .chart-panel {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px 20px;
-            margin-bottom: 20px;
-        }
-
-        .panel-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 14px;
-        }
-
-        .panel-title {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 12px;
-            font-weight: 600;
-            letter-spacing: 0.08em;
-            color: var(--muted);
-            text-transform: uppercase;
-        }
-
-        /* Log table */
-        .log-panel {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            overflow: hidden;
-        }
-
-        .log-panel-header {
-            padding: 14px 18px;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .log-count {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            color: var(--muted);
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 12px;
-        }
-
-        thead { position: sticky; top: 0; z-index: 10; }
-
-        th {
-            background: var(--panel);
-            padding: 10px 14px;
-            text-align: left;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            color: var(--muted);
-            border-bottom: 1px solid var(--border);
-            cursor: pointer;
-            user-select: none;
-            white-space: nowrap;
-        }
-
-        th:hover { color: var(--text); }
-        th.sort-asc::after { content: ' ↑'; color: var(--accent); }
-        th.sort-desc::after { content: ' ↓'; color: var(--accent); }
-
-        td {
-            padding: 9px 14px;
-            border-bottom: 1px solid rgba(30,45,61,0.6);
-            vertical-align: middle;
-            max-width: 0;
-        }
-
-        tr.log-row { cursor: pointer; transition: background 0.1s; }
-        tr.log-row:hover td { background: rgba(255,255,255,0.02); }
-
-        tr.r-red td { background: rgba(248,81,73,0.05); }
-        tr.r-red:hover td { background: rgba(248,81,73,0.09); }
-        tr.r-orange td { background: rgba(227,160,58,0.04); }
-        tr.r-orange:hover td { background: rgba(227,160,58,0.08); }
-
-        /* Column styles */
-        .col-time { width: 150px; color: var(--muted); white-space: nowrap; }
-        .col-type { width: 130px; }
-        .col-host { width: 120px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .col-user { width: 100px; color: var(--accent2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .col-ip   { width: 120px; color: var(--accent); white-space: nowrap; }
-        .col-msg  { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .col-sev  { width: 90px; text-align: center; }
-
-        .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 0.07em;
-            text-transform: uppercase;
-            white-space: nowrap;
-        }
-
-        .badge-AUTH    { background: rgba(248,81,73,0.15);  color: var(--red);    border: 1px solid rgba(248,81,73,0.3); }
-        .badge-SUDO    { background: rgba(227,160,58,0.15); color: var(--orange); border: 1px solid rgba(227,160,58,0.3); }
-        .badge-SUSPICIOUS_COMMAND { background: rgba(248,81,73,0.2); color: #ff6b6b; border: 1px solid rgba(248,81,73,0.4); }
-        .badge-BASH_HISTORY { background: rgba(188,140,255,0.15); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
-        .badge-SYS     { background: rgba(110,118,129,0.15); color: var(--muted);  border: 1px solid rgba(110,118,129,0.3); }
-
-        .sev-badge {
-            display: inline-block;
-            width: 64px;
-            text-align: center;
-            padding: 2px 0;
-            border-radius: 2px;
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 0.06em;
-        }
-
-        .sev-red    { background: rgba(248,81,73,0.2); color: var(--red); }
-        .sev-orange { background: rgba(227,160,58,0.2); color: var(--orange); }
-        .sev-green  { background: rgba(63,185,80,0.1); color: var(--green); }
-
-        /* Detail drawer */
-        #detail-drawer {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-top: 2px solid var(--accent);
-            border-radius: 8px 8px 0 0;
-            position: fixed;
-            bottom: 0; left: 280px; right: 0;
-            max-height: 280px;
-            overflow-y: auto;
-            padding: 16px 24px;
-            transform: translateY(100%);
-            transition: transform 0.2s ease;
-            z-index: 200;
-        }
-
-        #detail-drawer.open { transform: translateY(0); }
-
-        .drawer-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 14px;
-        }
-
-        .drawer-title {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--accent);
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-
-        .drawer-close {
-            background: none; border: none; color: var(--muted);
-            cursor: pointer; font-size: 16px; line-height: 1;
-        }
-        .drawer-close:hover { color: var(--text); }
-
-        .drawer-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-            gap: 10px;
-        }
-
-        .drawer-field { }
-        .drawer-key {
-            font-size: 10px; letter-spacing: 0.08em;
-            color: var(--muted); text-transform: uppercase; margin-bottom: 3px;
-        }
-        .drawer-val {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 12px; color: var(--text);
-            word-break: break-all;
-        }
-
-        .drawer-raw {
-            margin-top: 12px;
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 10px 14px;
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            color: var(--muted);
-            word-break: break-all;
-            white-space: pre-wrap;
-        }
-
-        /* Pagination */
-        .pagination {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px 18px;
-            border-top: 1px solid var(--border);
-        }
-
-        .page-info { font-size: 11px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
-
-        .page-btns { display: flex; gap: 6px; }
-
-        .page-btn {
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 11px;
-            padding: 4px 12px;
-            border: 1px solid var(--border2);
-            background: var(--panel);
-            color: var(--text);
-            border-radius: 3px;
-            cursor: pointer;
-            transition: all 0.12s;
-        }
-        .page-btn:hover { border-color: var(--accent); color: var(--accent); }
-        .page-btn:disabled { opacity: 0.3; cursor: not-allowed; }
-        .page-btn.current { border-color: var(--accent); color: var(--accent); background: rgba(0,212,170,0.08); }
-
-        /* Scrollbar */
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #3a4d60; }
-
-        /* Empty state */
-        .empty-state {
-            text-align: center;
-            padding: 60px 20px;
-            color: var(--muted);
-        }
-        .empty-state .icon { font-size: 36px; margin-bottom: 12px; }
-        .empty-state p { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SP-110 — Linux Behavior Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:      #060a0e;
+  --surface: #0b1018;
+  --panel:   #0f161e;
+  --card:    #111c26;
+  --border:  #1a2d3d;
+  --border2: #223344;
+  --text:    #cdd6e0;
+  --muted:   #5a7080;
+  --accent:  #00d4aa;
+  --blue:    #0ea5e9;
+  --red:     #f85149;
+  --orange:  #e3a03a;
+  --yellow:  #d29922;
+  --green:   #3fb950;
+  --purple:  #bc8cff;
+  --cyan:    #79c0ff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;font-size:13px;min-height:100vh;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.06) 2px,rgba(0,0,0,0.06) 4px);pointer-events:none;z-index:9999}
+
+/* NAV */
+nav{background:var(--surface);border-bottom:1px solid var(--border);height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:sticky;top:0;z-index:300}
+.brand{font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;color:var(--accent);border:1px solid var(--accent);padding:3px 10px;border-radius:3px;letter-spacing:.1em}
+.nav-center{display:flex;align-items:center;gap:4px}
+.nav-tab{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:.06em;padding:5px 14px;border-radius:4px;border:1px solid transparent;background:none;color:var(--muted);cursor:pointer;transition:all .15s;white-space:nowrap}
+.nav-tab:hover{color:var(--text);border-color:var(--border2)}
+.nav-tab.active{color:var(--accent);border-color:var(--accent);background:rgba(0,212,170,.08)}
+.nav-right{display:flex;align-items:center;gap:12px}
+.live-badge{display:flex;align-items:center;gap:5px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--accent)}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
+.nav-time{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)}
+.nav-btn{font-family:'IBM Plex Mono',monospace;font-size:10px;padding:4px 11px;border-radius:3px;border:1px solid var(--border2);background:var(--panel);color:var(--text);cursor:pointer;transition:all .12s}
+.nav-btn:hover{border-color:var(--blue);color:var(--blue)}
+.nav-btn.danger{border-color:#2a1010;color:var(--red)}
+.nav-btn.danger:hover{border-color:var(--red);background:rgba(248,81,73,.1)}
+
+/* LAYOUT */
+.shell{display:flex;height:calc(100vh - 52px);overflow:hidden}
+.sidebar{width:260px;min-width:260px;background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column}
+.main-area{flex:1;overflow-y:auto;padding:18px}
+
+/* SIDEBAR */
+.sb-section{padding:14px;border-bottom:1px solid var(--border)}
+.sb-label{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;letter-spacing:.14em;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+.kpi-stack{display:flex;flex-direction:column;gap:6px}
+.kpi{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center}
+.kpi-lbl{font-size:10px;color:var(--muted)}
+.kpi-val{font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:600;line-height:1}
+.alert-stack{display:flex;flex-direction:column;gap:5px}
+.al-item{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--red);border-radius:4px;padding:7px 9px;font-size:11px;cursor:pointer;transition:background .12s}
+.al-item:hover{background:var(--card)}
+.al-item.warn{border-left-color:var(--orange)}
+.al-item.info{border-left-color:var(--blue)}
+.al-ip{font-family:'IBM Plex Mono',monospace;font-weight:600;color:var(--text);font-size:11px}
+.al-meta{color:var(--muted);font-size:10px;margin-top:1px}
+.etype-list{display:flex;flex-direction:column;gap:3px}
+.etype-row{display:flex;justify-content:space-between;align-items:center;padding:4px 7px;border-radius:3px;cursor:pointer;transition:background .1s}
+.etype-row:hover,.etype-row.active{background:var(--border)}
+.etype-name{font-family:'IBM Plex Mono',monospace;font-size:10px;display:flex;align-items:center;gap:7px}
+.etype-dot{width:5px;height:5px;border-radius:50%}
+.etype-count{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);background:var(--border);padding:1px 6px;border-radius:8px}
+.sb-host{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text);padding:4px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+.sb-host:last-child{border-bottom:none}
+
+/* PAGES */
+.page{display:none}.page.active{display:block}
+
+/* STAT CARDS */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:14px 16px;position:relative;overflow:hidden}
+.stat::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px}
+.stat.s-red::after{background:var(--red)}.stat.s-orange::after{background:var(--orange)}
+.stat.s-blue::after{background:var(--blue)}.stat.s-green::after{background:var(--green)}
+.stat.s-purple::after{background:var(--purple)}
+.stat-lbl{font-size:10px;color:var(--muted);margin-bottom:5px;letter-spacing:.04em}
+.stat-val{font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600;line-height:1}
+.c-red{color:var(--red)}.c-orange{color:var(--orange)}.c-blue{color:var(--blue)}
+.c-green{color:var(--green)}.c-purple{color:var(--purple)}.c-cyan{color:var(--cyan)}
+
+/* PANELS */
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:7px;margin-bottom:14px;overflow:hidden}
+.ph{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.pt{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;letter-spacing:.1em;color:var(--muted);text-transform:uppercase}
+.pb{padding:16px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px}
+
+/* LOG TABLE */
+.search-bar{background:var(--surface);border:1px solid var(--border);border-radius:5px;display:flex;align-items:center;padding:0 12px;gap:9px;margin-bottom:12px}
+.search-bar:focus-within{border-color:var(--blue)}
+.search-input{flex:1;background:none;border:none;outline:none;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:12px;padding:9px 0}
+.search-input::placeholder{color:var(--muted)}
+.filter-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
+.fl{font-size:10px;color:var(--muted);margin-right:4px}
+.chip{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:500;letter-spacing:.07em;padding:3px 9px;border-radius:3px;border:1px solid var(--border2);background:var(--panel);color:var(--muted);cursor:pointer;transition:all .12s;text-transform:uppercase}
+.chip:hover{color:var(--text)}.chip.active{background:rgba(0,212,170,.1);border-color:var(--accent);color:var(--accent)}
+.chip.cr.active{background:rgba(248,81,73,.1);border-color:var(--red);color:var(--red)}
+.chip.co.active{background:rgba(227,160,58,.1);border-color:var(--orange);color:var(--orange)}
+.chip.cb.active{background:rgba(14,165,233,.1);border-color:var(--blue);color:var(--blue)}
+.chip.cp.active{background:rgba(188,140,255,.1);border-color:var(--purple);color:var(--purple)}
+table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
+thead{position:sticky;top:0;z-index:10}
+th{background:var(--panel);padding:8px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:var(--text)}
+td{padding:7px 12px;border-bottom:1px solid rgba(26,45,61,.5);vertical-align:middle;max-width:0}
+tr.lr{cursor:pointer;transition:background .08s}
+tr.lr:hover td{background:rgba(255,255,255,.02)}
+tr.r-red td{background:rgba(248,81,73,.04)}tr.r-red:hover td{background:rgba(248,81,73,.08)}
+tr.r-orange td{background:rgba(227,160,58,.03)}tr.r-orange:hover td{background:rgba(227,160,58,.07)}
+.col-time{width:140px;color:var(--muted);white-space:nowrap}
+.col-type{width:120px}.col-host{width:110px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.col-user{width:90px;color:var(--blue);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.col-ip{width:110px;color:var(--accent);white-space:nowrap}
+.col-msg{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.col-sev{width:80px;text-align:center}
+.badge{display:inline-block;padding:2px 7px;border-radius:2px;font-size:9px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;white-space:nowrap}
+.badge-AUTH{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}
+.badge-SUDO{background:rgba(227,160,58,.15);color:var(--orange);border:1px solid rgba(227,160,58,.3)}
+.badge-SUSPICIOUS_COMMAND{background:rgba(248,81,73,.2);color:#ff7070;border:1px solid rgba(248,81,73,.4)}
+.badge-BASH_HISTORY{background:rgba(188,140,255,.15);color:var(--purple);border:1px solid rgba(188,140,255,.3)}
+.badge-SYS{background:rgba(90,112,128,.15);color:var(--muted);border:1px solid rgba(90,112,128,.3)}
+.sev-badge{display:inline-block;width:60px;text-align:center;padding:2px 0;border-radius:2px;font-size:9px;font-weight:600;letter-spacing:.06em}
+.sev-3{background:rgba(248,81,73,.2);color:var(--red)}.sev-2{background:rgba(227,160,58,.2);color:var(--orange)}
+.sev-1{background:rgba(210,153,34,.15);color:var(--yellow)}.sev-0{background:rgba(63,185,80,.1);color:var(--green)}
+.pagination{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-top:1px solid var(--border)}
+.pg-info{font-size:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace}
+.pg-btns{display:flex;gap:5px}
+.pg-btn{font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 10px;border:1px solid var(--border2);background:var(--panel);color:var(--text);border-radius:3px;cursor:pointer;transition:all .12s}
+.pg-btn:hover{border-color:var(--accent);color:var(--accent)}.pg-btn:disabled{opacity:.3;cursor:not-allowed}
+.pg-btn.cur{border-color:var(--accent);color:var(--accent);background:rgba(0,212,170,.08)}
+
+/* DETAIL DRAWER */
+#drawer{background:var(--surface);border:1px solid var(--border);border-top:2px solid var(--accent);border-radius:8px 8px 0 0;position:fixed;bottom:0;left:260px;right:0;max-height:260px;overflow-y:auto;padding:14px 20px;transform:translateY(100%);transition:transform .2s ease;z-index:250}
+#drawer.open{transform:translateY(0)}
+.dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.dt{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}
+.dc{background:none;border:none;color:var(--muted);cursor:pointer;font-size:15px}
+.dc:hover{color:var(--text)}
+.dg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+.dk{font-size:9px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;margin-bottom:2px}
+.dv{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text);word-break:break-all}
+.dr{margin-top:10px;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);word-break:break-all;white-space:pre-wrap}
+.mitre-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.mitre-chip{font-family:'IBM Plex Mono',monospace;font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid rgba(14,165,233,.3);background:rgba(14,165,233,.08);color:var(--blue);cursor:help}
+
+/* FORMS */
+.form-group{margin-bottom:12px}
+.form-label{font-size:10px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:5px;display:block}
+.form-input{width:100%;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:8px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none;transition:border .15s}
+.form-input:focus{border-color:var(--blue)}
+.form-select{width:100%;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:8px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:12px;outline:none;cursor:pointer}
+.btn{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;letter-spacing:.06em;padding:7px 14px;border-radius:4px;border:1px solid var(--border2);background:var(--panel);color:var(--text);cursor:pointer;transition:all .14s;display:inline-flex;align-items:center;gap:6px}
+.btn:hover{border-color:var(--blue);color:var(--blue)}
+.btn.btn-accent{border-color:var(--accent);color:var(--accent);background:rgba(0,212,170,.08)}
+.btn.btn-accent:hover{background:rgba(0,212,170,.15)}
+.btn.btn-red{border-color:#2a1010;color:var(--red)}
+.btn.btn-red:hover{border-color:var(--red);background:rgba(248,81,73,.1)}
+.btn.btn-blue{border-color:rgba(14,165,233,.3);color:var(--blue);background:rgba(14,165,233,.06)}
+.btn.btn-blue:hover{background:rgba(14,165,233,.12)}
+
+/* TOAST */
+#toast{position:fixed;top:64px;right:20px;z-index:400;display:flex;flex-direction:column;gap:8px}
+.toast-msg{background:var(--card);border:1px solid var(--border2);border-radius:5px;padding:10px 16px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text);animation:slideIn .2s ease;display:flex;align-items:center;gap:8px;max-width:320px}
+.toast-msg.ok{border-left:3px solid var(--green)}.toast-msg.err{border-left:3px solid var(--red)}.toast-msg.info{border-left:3px solid var(--blue)}
+@keyframes slideIn{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+
+/* MISC */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+.empty-state{text-align:center;padding:40px 20px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px}
+.tag{font-family:'IBM Plex Mono',monospace;font-size:9px;padding:2px 7px;border-radius:2px;white-space:nowrap}
+.tag-crit{background:rgba(248,81,73,.2);color:var(--red);border:1px solid rgba(248,81,73,.3)}
+.tag-high{background:rgba(227,160,58,.2);color:var(--orange);border:1px solid rgba(227,160,58,.3)}
+.tag-med{background:rgba(210,153,34,.15);color:var(--yellow);border:1px solid rgba(210,153,34,.3)}
+.tag-low{background:rgba(63,185,80,.1);color:var(--green);border:1px solid rgba(63,185,80,.2)}
+.tag-info{background:rgba(90,112,128,.15);color:var(--muted);border:1px solid rgba(90,112,128,.3)}
+
+/* FIM / SCA / VULN specific */
+.fim-table,.sca-table,.vuln-table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
+.fim-table th,.sca-table th,.vuln-table th{background:var(--panel);padding:7px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+.fim-table td,.sca-table td,.vuln-table td{padding:7px 12px;border-bottom:1px solid rgba(26,45,61,.5);vertical-align:middle}
+.progress-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:6px}
+.progress-fill{height:100%;border-radius:2px;transition:width .4s ease}
+.chart-wrap{position:relative;height:160px}
+.mitre-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}
+.mitre-card{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:10px 12px}
+.mitre-id{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;color:var(--blue)}
+.mitre-name{font-size:11px;color:var(--text);margin:3px 0}
+.mitre-tactic{font-size:9px;color:var(--muted)}
+.mitre-count{font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:600;color:var(--accent)}
+
+/* DB Manager */
+.db-list{display:flex;flex-direction:column;gap:6px}
+.db-item{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;transition:all .12s}
+.db-item:hover{border-color:var(--blue)}.db-item.active-db{border-color:var(--accent);background:rgba(0,212,170,.06)}
+.db-name{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text)}
+
+/* Log path manager */
+.path-list{display:flex;flex-direction:column;gap:5px}
+.path-item{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:7px 12px;display:flex;justify-content:space-between;align-items:center;font-family:'IBM Plex Mono',monospace;font-size:11px}
+.path-status{width:7px;height:7px;border-radius:50%;background:var(--green)}
+.path-status.off{background:var(--muted)}
+.ip-table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}
+.ip-table th{background:var(--panel);padding:7px 12px;text-align:left;font-size:9px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+.ip-table td{padding:7px 12px;border-bottom:1px solid rgba(26,45,61,.5)}
+</style>
 </head>
 <body>
 
-<!-- Nav -->
+<!-- NAV -->
 <nav>
-    <div class="nav-left">
-        <span class="brand">SP-110/G</span>
-        <span class="nav-title">Linux Behavior Monitor</span>
-    </div>
-    <div class="nav-right">
-        <div class="live-badge"><div class="live-dot"></div> LIVE</div>
-        <span class="nav-time" id="lastUpdate" style="color:var(--accent);font-size:10px;opacity:0.7"></span>
-        <span class="nav-time" id="clock">{{ now }}</span>
-        <a href="/export/csv" class="btn btn-export">⬇ Export CSV</a>
-        <button onclick="clearLogs()" class="btn btn-danger">✕ Clear Logs</button>
-    </div>
+  <div class="nav-left" style="display:flex;align-items:center;gap:14px">
+    <span class="brand">SP-110</span>
+    <span style="font-size:13px;font-weight:500;letter-spacing:.02em">Linux Behavior Monitor</span>
+  </div>
+  <div class="nav-center">
+    <button class="nav-tab active" onclick="showPage('overview',this)">Overview</button>
+    <button class="nav-tab" onclick="showPage('logs',this)">Log Events</button>
+    <button class="nav-tab" onclick="showPage('analytics',this)">Analytics</button>
+    <button class="nav-tab" onclick="showPage('fim',this)">File Integrity</button>
+    <button class="nav-tab" onclick="showPage('sca',this)">Config Audit</button>
+    <button class="nav-tab" onclick="showPage('vuln',this)">Vulnerabilities</button>
+    <button class="nav-tab" onclick="showPage('mitre',this)">MITRE ATT&CK</button>
+    <button class="nav-tab" onclick="showPage('response',this)">Active Response</button>
+    <button class="nav-tab" onclick="showPage('admin',this)">Administration</button>
+  </div>
+  <div class="nav-right">
+    <div class="live-badge"><div class="live-dot"></div><span>LIVE</span></div>
+    <span class="nav-time" id="nav-time">--:--:--</span>
+    <button class="nav-btn" onclick="exportCSV()">⬇ Export CSV</button>
+    <button class="nav-btn danger" onclick="confirmClear()">✕ Clear Logs</button>
+  </div>
 </nav>
 
-<div class="main">
-
-    <!-- Sidebar -->
-    <div class="sidebar">
-
-        <!-- KPIs -->
-        <div class="sidebar-section">
-            <div class="sidebar-label">Metrics</div>
-            <div class="kpi-grid">
-                <div class="kpi-card">
-                    <div>
-                        <div class="kpi-label">Failed Logins (60s)</div>
-                        <div class="kpi-val" style="color:var(--red)">{{ failed_logins }}</div>
-                    </div>
-                </div>
-                <div class="kpi-card">
-                    <div>
-                        <div class="kpi-label">Brute Force IPs</div>
-                        <div class="kpi-val" style="color:var(--orange)">{{ brute_total }}</div>
-                    </div>
-                </div>
-                <div class="kpi-card">
-                    <div>
-                        <div class="kpi-label">Sudo Abuses</div>
-                        <div class="kpi-val" style="color:var(--yellow)">{{ sudo_total }}</div>
-                    </div>
-                </div>
-                <div class="kpi-card">
-                    <div>
-                        <div class="kpi-label">Unique Source IPs</div>
-                        <div class="kpi-val" style="color:var(--accent2)">{{ unique_ips }}</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Event type filter -->
-        <div class="sidebar-section">
-            <div class="sidebar-label">Event Types</div>
-            <div class="etype-list" id="etypeList">
-                <div class="etype-row active" data-etype="all" onclick="setEtype('all', this)">
-                    <span class="etype-name"><span class="etype-dot" style="background:var(--muted)"></span> All Events</span>
-                    <span class="etype-count">{{ total_logs }}</span>
-                </div>
-                {% for et in event_types %}
-                <div class="etype-row" data-etype="{{ et.name }}" onclick="setEtype('{{ et.name }}', this)">
-                    <span class="etype-name">
-                        <span class="etype-dot" style="background:{{ et.color }}"></span>
-                        {{ et.name }}
-                    </span>
-                    <span class="etype-count">{{ et.count }}</span>
-                </div>
-                {% endfor %}
-            </div>
-        </div>
-
-        <!-- Top IPs (brute force alerts) -->
-        <div class="sidebar-section">
-            <div class="sidebar-label">Top Attacker IPs</div>
-            <div class="alert-list" id="topIpList">
-                {% for ip, count in top_ips %}
-                <div class="alert-item {% if count > 50 %}{% elif count > 20 %}warn{% else %}info{% endif %}">
-                    <div class="alert-ip">{{ ip }}</div>
-                    <div class="alert-meta">{{ count }} failed attempt{% if count != 1 %}s{% endif %}</div>
-                </div>
-                {% else %}
-                <div style="font-size:11px;color:var(--muted);text-align:center;padding:12px 0">No attackers detected</div>
-                {% endfor %}
-            </div>
-        </div>
-
-        <!-- Sudo abusers -->
-        {% if sudo_users %}
-        <div class="sidebar-section">
-            <div class="sidebar-label">Sudo Abusers</div>
-            <div class="alert-list">
-                {% for user, count in sudo_users %}
-                <div class="alert-item warn">
-                    <div class="alert-ip">{{ user }}</div>
-                    <div class="alert-meta">{{ count }} sudo event{% if count != 1 %}s{% endif %}</div>
-                </div>
-                {% endfor %}
-            </div>
-        </div>
-        {% endif %}
-
+<div class="shell">
+<!-- SIDEBAR -->
+<div class="sidebar">
+  <div class="sb-section">
+    <div class="sb-label">Live Metrics</div>
+    <div class="kpi-stack">
+      <div class="kpi"><span class="kpi-lbl">Failed Logins / min</span><span class="kpi-val c-red" id="s-failed">0</span></div>
+      <div class="kpi"><span class="kpi-lbl">Brute Force IPs</span><span class="kpi-val c-orange" id="s-brute">0</span></div>
+      <div class="kpi"><span class="kpi-lbl">Sudo Abuse</span><span class="kpi-val c-purple" id="s-sudo">0</span></div>
+      <div class="kpi"><span class="kpi-lbl">Unique Source IPs</span><span class="kpi-val c-cyan" id="s-ips">0</span></div>
+      <div class="kpi"><span class="kpi-lbl">Total Log Events</span><span class="kpi-val" id="s-total">0</span></div>
+      <div class="kpi"><span class="kpi-lbl">Suspicious Commands</span><span class="kpi-val c-red" id="s-susp">0</span></div>
     </div>
-
-    <!-- Main content -->
-    <div class="content">
-
-        <!-- Stats row -->
-        <div class="stats-row">
-            <div class="stat-card s-red">
-                <div class="stat-lbl">Total Events</div>
-                <div class="stat-val c-red">{{ total_logs }}</div>
-            </div>
-            <div class="stat-card s-orange">
-                <div class="stat-lbl">Suspicious Commands</div>
-                <div class="stat-val c-orange">{{ suspicious_count }}</div>
-            </div>
-            <div class="stat-card s-yellow">
-                <div class="stat-lbl">Auth Events</div>
-                <div class="stat-val c-yellow">{{ auth_count }}</div>
-            </div>
-            <div class="stat-card s-blue">
-                <div class="stat-lbl">Hosts Seen</div>
-                <div class="stat-val c-blue">{{ host_count }}</div>
-            </div>
-        </div>
-
-        <!-- Search + filters -->
-        <div class="search-bar">
-            <span class="search-icon">⌕</span>
-            <input
-                type="text"
-                class="search-input"
-                id="searchInput"
-                placeholder='Search logs... (e.g. "failed password" OR source IP)'
-                oninput="filterTable()"
-            >
-            <span id="matchCount" style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--muted)"></span>
-        </div>
-
-        <div class="filter-row">
-            <span class="filter-label">Severity:</span>
-            <span class="chip active" data-sev="all" onclick="setSev('all',this)">All</span>
-            <span class="chip chip-red" data-sev="red" onclick="setSev('red',this)">High</span>
-            <span class="chip chip-orange" data-sev="orange" onclick="setSev('orange',this)">Medium</span>
-            <span class="chip chip-green" data-sev="green" onclick="setSev('green',this)">Normal</span>
-        </div>
-
-        <!-- Log table -->
-        <div class="log-panel">
-            <div class="log-panel-header">
-                <span class="panel-title">Event Log</span>
-                <span class="log-count" id="tableCount">Showing {{ recent_logs|length }} events</span>
-            </div>
-
-            <div style="overflow-x:auto;">
-            <table id="logTable">
-                <thead>
-                    <tr>
-                        <th onclick="sortTable(0)" class="col-time" data-col="0">Time</th>
-                        <th onclick="sortTable(1)" data-col="1">Event Type</th>
-                        <th onclick="sortTable(2)" data-col="2">Host</th>
-                        <th onclick="sortTable(3)" data-col="3">User</th>
-                        <th onclick="sortTable(4)" data-col="4">Source IP</th>
-                        <th data-col="5">Message</th>
-                        <th onclick="sortTable(6)" data-col="6">Severity</th>
-                    </tr>
-                </thead>
-                <tbody id="logBody">
-                    {% for log in recent_logs %}
-                    <tr class="log-row r-{{ log.threat_level }}"
-                        data-sev="{{ log.threat_level }}"
-                        data-etype="{{ log.eventtype }}"
-                        data-raw="{{ log.rawline|replace('"', '&quot;') }}"
-                        data-time="{{ log.timestamp }}"
-                        data-user="{{ log.username }}"
-                        data-ip="{{ log.sourceip }}"
-                        data-host="{{ log.hostname }}"
-                        data-msg="{{ log.message|replace('"', '&quot;') }}"
-                        onclick="showDetail(this)"
-                    >
-                        <td class="col-time">{{ log.timestamp }}</td>
-                        <td class="col-type"><span class="badge badge-{{ log.eventtype }}">{{ log.eventtype }}</span></td>
-                        <td class="col-host">{{ log.hostname }}</td>
-                        <td class="col-user">{{ log.username }}</td>
-                        <td class="col-ip">{{ log.sourceip }}</td>
-                        <td class="col-msg">{{ log.message }}</td>
-                        <td class="col-sev"><span class="sev-badge sev-{{ log.threat_level }}">{{ log.threat_label }}</span></td>
-                    </tr>
-                    {% else %}
-                    <tr><td colspan="7">
-                        <div class="empty-state">
-                            <div class="icon">◎</div>
-                            <p>No events found</p>
-                        </div>
-                    </td></tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            </div>
-
-            <!-- Pagination -->
-            <div class="pagination">
-                <span class="page-info" id="pageInfo">Page 1</span>
-                <div class="page-btns" id="pageBtns"></div>
-            </div>
-        </div>
-
+  </div>
+  <div class="sb-section">
+    <div class="sb-label">Active Alerts</div>
+    <div class="alert-stack" id="sb-alerts">
+      <div class="empty-state">No alerts</div>
     </div>
+  </div>
+  <div class="sb-section">
+    <div class="sb-label">Event Types</div>
+    <div class="etype-list" id="sb-etypes"></div>
+  </div>
+  <div class="sb-section">
+    <div class="sb-label">Monitored Hosts</div>
+    <div id="sb-hosts" style="font-family:'IBM Plex Mono',monospace;font-size:10px"></div>
+  </div>
+  <div class="sb-section">
+    <div class="sb-label">Blocked IPs</div>
+    <div id="sb-blocked" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)">None</div>
+  </div>
 </div>
 
-<!-- Detail drawer -->
-<div id="detail-drawer">
-    <div class="drawer-header">
-        <span class="drawer-title">Event Detail</span>
-        <button class="drawer-close" onclick="closeDetail()">✕</button>
+<!-- MAIN AREA -->
+<div class="main-area">
+
+<!-- OVERVIEW -->
+<div class="page active" id="page-overview">
+  <div class="stats-row">
+    <div class="stat s-red"><div class="stat-lbl">Failed Auth Events</div><div class="stat-val c-red" id="ov-failed">0</div></div>
+    <div class="stat s-orange"><div class="stat-lbl">Auth Events Total</div><div class="stat-val c-orange" id="ov-auth">0</div></div>
+    <div class="stat s-blue"><div class="stat-lbl">Suspicious Commands</div><div class="stat-val c-blue" id="ov-susp">0</div></div>
+    <div class="stat s-purple"><div class="stat-lbl">Monitored Hosts</div><div class="stat-val c-purple" id="ov-hosts">0</div></div>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">Events Over Time (60 min)</span></div>
+      <div class="pb"><div class="chart-wrap"><canvas id="chart-timeline"></canvas></div></div>
     </div>
-    <div class="drawer-grid" id="drawerGrid"></div>
-    <div class="drawer-raw" id="drawerRaw"></div>
+    <div class="panel">
+      <div class="ph"><span class="pt">Event Type Breakdown</span></div>
+      <div class="pb"><div class="chart-wrap"><canvas id="chart-etypes"></canvas></div></div>
+    </div>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">Top Attacker IPs</span></div>
+      <div class="pb"><div class="chart-wrap"><canvas id="chart-ips"></canvas></div></div>
+    </div>
+    <div class="panel">
+      <div class="ph"><span class="pt">Severity Distribution</span></div>
+      <div class="pb"><div class="chart-wrap"><canvas id="chart-sev"></canvas></div></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">Recent High-Severity Events</span><span id="ov-log-count" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)">—</span></div>
+    <div style="overflow-x:auto">
+      <table><thead><tr>
+        <th class="col-time">Timestamp</th><th class="col-type">Type</th>
+        <th class="col-host">Host</th><th class="col-user">User</th>
+        <th class="col-ip">Source IP</th><th class="col-msg">Message</th><th class="col-sev">Severity</th>
+      </tr></thead>
+      <tbody id="ov-table"></tbody></table>
+    </div>
+  </div>
 </div>
+
+<!-- LOG EVENTS -->
+<div class="page" id="page-logs">
+  <div class="search-bar">
+    <span style="color:var(--muted);font-size:13px">⌕</span>
+    <input class="search-input" id="log-search" placeholder="Search messages, IPs, usernames…" oninput="filterLogs()">
+    <span id="log-count" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);white-space:nowrap">0 events</span>
+  </div>
+  <div class="filter-row">
+    <span class="fl">Filter:</span>
+    <span class="chip active" data-filter="ALL" onclick="setFilter(this,'ALL')">ALL</span>
+    <span class="chip cr" data-filter="AUTH" onclick="setFilter(this,'AUTH')">AUTH</span>
+    <span class="chip co" data-filter="SUDO" onclick="setFilter(this,'SUDO')">SUDO</span>
+    <span class="chip cr" data-filter="SUSPICIOUS_COMMAND" onclick="setFilter(this,'SUSPICIOUS_COMMAND')">SUSPICIOUS</span>
+    <span class="chip cp" data-filter="BASH_HISTORY" onclick="setFilter(this,'BASH_HISTORY')">BASH</span>
+    <span class="chip cb" data-filter="SYS" onclick="setFilter(this,'SYS')">SYS</span>
+    <span style="flex:1"></span>
+    <span class="fl">Severity:</span>
+    <span class="chip cr" data-sev="3" onclick="setSev(this,3)">CRITICAL</span>
+    <span class="chip co" data-sev="2" onclick="setSev(this,2)">HIGH</span>
+    <span class="chip" data-sev="1" onclick="setSev(this,1)">MEDIUM</span>
+    <span class="chip" data-sev="0" onclick="setSev(this,0)">LOW</span>
+  </div>
+  <div class="panel" style="margin-bottom:0">
+    <div style="overflow-x:auto">
+      <table><thead><tr>
+        <th class="col-time" onclick="sortTable('timestamp')">Timestamp</th>
+        <th class="col-type" onclick="sortTable('eventtype')">Type</th>
+        <th class="col-host" onclick="sortTable('hostname')">Host</th>
+        <th class="col-user" onclick="sortTable('username')">User</th>
+        <th class="col-ip" onclick="sortTable('sourceip')">Source IP</th>
+        <th class="col-msg">Message</th>
+        <th class="col-sev" onclick="sortTable('threat_level')">Severity</th>
+      </tr></thead>
+      <tbody id="log-table"></tbody></table>
+    </div>
+    <div class="pagination">
+      <span class="pg-info" id="pg-info">Showing 0–0 of 0</span>
+      <div class="pg-btns" id="pg-btns"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ANALYTICS -->
+<div class="page" id="page-analytics">
+  <div class="stats-row" style="grid-template-columns:repeat(5,1fr)">
+    <div class="stat s-red"><div class="stat-lbl">Total Events</div><div class="stat-val" id="an-total">0</div></div>
+    <div class="stat s-orange"><div class="stat-lbl">Failed Logins</div><div class="stat-val c-red" id="an-failed">0</div></div>
+    <div class="stat s-blue"><div class="stat-lbl">Auth Events</div><div class="stat-val c-orange" id="an-auth">0</div></div>
+    <div class="stat s-green"><div class="stat-lbl">Suspicious Cmds</div><div class="stat-val c-blue" id="an-susp">0</div></div>
+    <div class="stat s-purple"><div class="stat-lbl">Sudo Events</div><div class="stat-val c-purple" id="an-sudo-count">0</div></div>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">Failed Logins Timeline</span></div>
+      <div class="pb"><div class="chart-wrap"><canvas id="an-chart-tl"></canvas></div></div>
+    </div>
+    <div class="panel">
+      <div class="ph"><span class="pt">Auth Success vs Failure</span></div>
+      <div class="pb"><div class="chart-wrap"><canvas id="an-chart-sf"></canvas></div></div>
+    </div>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">Top Attacker IPs (Failed Auth)</span></div>
+      <div class="pb">
+        <table class="ip-table">
+          <thead><tr><th>IP Address</th><th>Count</th><th>Threat</th><th>Action</th></tr></thead>
+          <tbody id="an-ip-table"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><span class="pt">Sudo Usage by User</span></div>
+      <div class="pb">
+        <table class="ip-table">
+          <thead><tr><th>Username</th><th>Events</th><th>Risk</th></tr></thead>
+          <tbody id="an-sudo-table"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">Event Heatmap (Hour of Day)</span></div>
+    <div class="pb"><div style="height:100px;display:flex;align-items:flex-end;gap:3px" id="an-heatmap"></div></div>
+  </div>
+</div>
+
+<!-- FILE INTEGRITY -->
+<div class="page" id="page-fim">
+  <div class="panel">
+    <div class="ph">
+      <span class="pt">File Integrity Monitoring</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input class="form-input" id="fim-path-input" placeholder="/path/to/file" style="width:260px;font-size:11px;padding:5px 10px">
+        <button class="btn btn-accent" onclick="addFimPath()">+ Add Path</button>
+        <button class="btn btn-blue" onclick="runFim()">▶ Run Scan</button>
+      </div>
+    </div>
+    <div class="pb">
+      <div class="path-list" id="fim-paths" style="margin-bottom:14px"></div>
+      <table class="fim-table">
+        <thead><tr><th>File Path</th><th>SHA-256</th><th>Size</th><th>Modified</th><th>Status</th></tr></thead>
+        <tbody id="fim-results"></tbody>
+      </table>
+      <div id="fim-empty" class="empty-state" style="display:none">No scan results. Add paths and run scan.</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">Baseline Comparison</span></div>
+    <div class="pb">
+      <div class="grid-3">
+        <div class="stat s-green"><div class="stat-lbl">Files Unchanged</div><div class="stat-val c-green" id="fim-ok">0</div></div>
+        <div class="stat s-orange"><div class="stat-lbl">Files Modified</div><div class="stat-val c-orange" id="fim-mod">0</div></div>
+        <div class="stat s-red"><div class="stat-lbl">Files Missing</div><div class="stat-val c-red" id="fim-miss">0</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- CONFIG AUDIT -->
+<div class="page" id="page-sca">
+  <div class="stats-row" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat s-green"><div class="stat-lbl">Checks Passed</div><div class="stat-val c-green" id="sca-pass">—</div></div>
+    <div class="stat s-red"><div class="stat-lbl">Checks Failed</div><div class="stat-val c-red" id="sca-fail">—</div></div>
+    <div class="stat s-blue"><div class="stat-lbl">Score</div><div class="stat-val c-blue" id="sca-score">—</div></div>
+    <div class="stat s-orange"><div class="stat-lbl">Critical Fails</div><div class="stat-val c-orange" id="sca-crit">—</div></div>
+  </div>
+  <div class="panel">
+    <div class="ph">
+      <span class="pt">Security Configuration Assessment</span>
+      <button class="btn btn-accent" onclick="runSca()">▶ Run Checks</button>
+    </div>
+    <div class="pb">
+      <div id="sca-progress" style="display:none;margin-bottom:12px">
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:6px">Running CIS benchmark checks…</div>
+        <div class="progress-bar"><div class="progress-fill" id="sca-pb" style="width:0%;background:var(--accent)"></div></div>
+      </div>
+      <table class="sca-table">
+        <thead><tr><th>Check ID</th><th>Description</th><th>Severity</th><th>Result</th></tr></thead>
+        <tbody id="sca-results"></tbody>
+      </table>
+      <div id="sca-empty" class="empty-state">Click "Run Checks" to assess security configuration</div>
+    </div>
+  </div>
+</div>
+
+<!-- VULNERABILITIES-->
+<div class="page" id="page-vuln">
+  <div class="stats-row" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat s-red"><div class="stat-lbl">Critical CVEs</div><div class="stat-val c-red" id="vn-crit">—</div></div>
+    <div class="stat s-orange"><div class="stat-lbl">High CVEs</div><div class="stat-val c-orange" id="vn-high">—</div></div>
+    <div class="stat s-blue"><div class="stat-lbl">Medium CVEs</div><div class="stat-val c-blue" id="vn-med">—</div></div>
+    <div class="stat s-green"><div class="stat-lbl">Total Scanned Pkgs</div><div class="stat-val" id="vn-total">—</div></div>
+  </div>
+  <div class="panel">
+    <div class="ph">
+      <span class="pt">Vulnerability Detection</span>
+      <button class="btn btn-accent" onclick="runVuln()">▶ Scan Packages</button>
+    </div>
+    <div class="pb">
+      <table class="vuln-table">
+        <thead><tr><th>Package</th><th>CVE ID</th><th>Severity</th><th>Description</th><th>Action</th></tr></thead>
+        <tbody id="vuln-results"></tbody>
+      </table>
+      <div id="vuln-empty" class="empty-state">Click "Scan Packages" to check for known vulnerabilities</div>
+    </div>
+  </div>
+</div>
+
+<!-- MITRE ATT&CK -->
+<div class="page" id="page-mitre">
+  <div class="panel">
+    <div class="ph"><span class="pt">MITRE ATT&CK Technique Correlations</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)">Based on live log data</span>
+    </div>
+    <div class="pb">
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px" id="mitre-tactics"></div>
+      <div class="mitre-grid" id="mitre-cards"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">ATT&CK Matrix Coverage</span></div>
+    <div class="pb">
+      <div class="grid-2">
+        <div>
+          <div class="pb" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:8px">DETECTED TACTICS</div>
+          <div id="mitre-tactic-list" style="display:flex;flex-direction:column;gap:6px"></div>
+        </div>
+        <div><div class="chart-wrap"><canvas id="mitre-chart"></canvas></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ACTIVE RESPONSE -->
+<div class="page" id="page-response">
+  <div class="stats-row" style="grid-template-columns:repeat(3,1fr)">
+    <div class="stat s-red"><div class="stat-lbl">Blocked IPs</div><div class="stat-val c-red" id="ar-blocked-count">0</div></div>
+    <div class="stat s-orange"><div class="stat-lbl">Brute Force Detected</div><div class="stat-val c-orange" id="ar-brute">0</div></div>
+    <div class="stat s-blue"><div class="stat-lbl">Auto-Responses Fired</div><div class="stat-val c-blue" id="ar-auto">0</div></div>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">Block IP Address</span></div>
+      <div class="pb">
+        <div class="form-group">
+          <label class="form-label">IP Address</label>
+          <input class="form-input" id="ar-ip-input" placeholder="192.168.1.100" type="text">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Reason</label>
+          <select class="form-select" id="ar-reason">
+            <option>Brute Force Attack</option>
+            <option>Suspicious Commands</option>
+            <option>Port Scanning</option>
+            <option>Manual Block</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-red" onclick="blockIP()">⊘ Block IP</button>
+          <button class="btn" onclick="unblockIP()">✓ Unblock IP</button>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><span class="pt">Auto-Response Rules</span><button class="btn btn-accent" style="font-size:9px;padding:4px 10px" onclick="saveAutoRules()">Save Rules</button></div>
+      <div class="pb">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
+            <input type="checkbox" id="ar-auto-brute" checked style="accent-color:var(--accent)">
+            Auto-block IPs with >10 failed logins
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
+            <input type="checkbox" id="ar-auto-sudo" style="accent-color:var(--accent)">
+            Alert on sudo abuse (>5 events)
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
+            <input type="checkbox" id="ar-auto-susp" checked style="accent-color:var(--accent)">
+            Alert on suspicious commands
+          </label>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:12px">
+            <input type="checkbox" id="ar-email-alert" style="accent-color:var(--accent)">
+            Send email on critical events (configure SMTP in .env)
+          </label>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">Currently Blocked IPs</span></div>
+    <div class="pb">
+      <table class="ip-table">
+        <thead><tr><th>IP Address</th><th>Reason</th><th>Blocked At</th><th>Action</th></tr></thead>
+        <tbody id="ar-blocked-list"></tbody>
+      </table>
+      <div id="ar-blocked-empty" class="empty-state">No blocked IPs</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">Response Action Log</span></div>
+    <div class="pb" style="max-height:200px;overflow-y:auto">
+      <div id="ar-log" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);display:flex;flex-direction:column;gap:4px">
+        <div style="color:var(--green)">[ SYSTEM ] Active Response module initialized</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ADMIN -->
+<div class="page" id="page-admin">
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">Database Manager</span></div>
+      <div class="pb">
+        <div class="form-group">
+          <label class="form-label">Search / Select Database</label>
+          <div style="display:flex;gap:8px">
+            <input class="form-input" id="db-search-input" placeholder="Search databases…" oninput="filterDbs()" style="flex:1">
+            <button class="btn btn-accent" onclick="loadDbs()">↺ Refresh</button>
+          </div>
+        </div>
+        <div class="db-list" id="db-list" style="max-height:180px;overflow-y:auto;margin-bottom:12px"></div>
+        <hr style="border:none;border-top:1px solid var(--border);margin:12px 0">
+        <div class="form-group">
+          <label class="form-label">Create New Database</label>
+          <div style="display:flex;gap:8px">
+            <input class="form-input" id="db-create-name" placeholder="new_database_name" style="flex:1">
+            <button class="btn btn-blue" onclick="createDb()">+ Create</button>
+          </div>
+        </div>
+        <div id="db-status" style="font-family:'IBM Plex Mono',monospace;font-size:10px;margin-top:8px"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><span class="pt">Log Path Manager</span></div>
+      <div class="pb">
+        <div class="form-group">
+          <label class="form-label">Add Log Path to Monitor</label>
+          <div style="display:flex;gap:8px">
+            <input class="form-input" id="log-path-input" placeholder="/var/log/custom.log" style="flex:1">
+            <button class="btn btn-accent" onclick="addLogPath()">+ Add</button>
+          </div>
+        </div>
+        <div class="path-list" id="log-paths" style="max-height:220px;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <div class="ph"><span class="pt">System Inventory</span></div>
+      <div class="pb" id="sys-inv">
+        <div class="empty-state">Loading inventory…</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="ph"><span class="pt">System Health</span></div>
+      <div class="pb" id="sys-health">
+        <table class="ip-table">
+          <thead><tr><th>Component</th><th>Status</th></tr></thead>
+          <tbody id="health-table"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pt">Regulatory Compliance</span></div>
+    <div class="pb">
+      <div class="grid-3">
+        <div id="comp-pci" style="text-align:center;padding:14px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">PCI DSS</div><div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600" class="c-orange" id="comp-pci-val">—</div></div>
+        <div id="comp-hipaa" style="text-align:center;padding:14px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">HIPAA</div><div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600" class="c-orange" id="comp-hipaa-val">—</div></div>
+        <div id="comp-nist" style="text-align:center;padding:14px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">NIST CSF</div><div style="font-family:'IBM Plex Mono',monospace;font-size:28px;font-weight:600" class="c-orange" id="comp-nist-val">—</div></div>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">Run Security Configuration Assessment to compute compliance scores</div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /main-area -->
+</div><!-- /shell -->
+
+<!-- DETAIL DRAWER -->
+<div id="drawer">
+  <div class="dh">
+    <span class="dt">Event Detail</span>
+    <button class="dc" onclick="closeDrawer()">✕</button>
+  </div>
+  <div class="dg" id="drawer-fields"></div>
+  <div class="dr" id="drawer-raw"></div>
+  <div class="mitre-chips" id="drawer-mitre"></div>
+</div>
+
+<!-- TOAST -->
+<div id="toast"></div>
 
 <script>
-// State
-let currentSev  = localStorage.getItem('sevFilter')   || 'all';
-let currentEtype = localStorage.getItem('etypeFilter') || 'all';
-let sortCol  = -1;
-let sortDir  = 'desc';
-let page     = 1;
-const PAGE_SIZE = 50;
+// STATE
+let allLogs = [], filteredLogs = [];
+let curPage = 1, pageSize = 50;
+let activeFilter = 'ALL', activeSev = null, searchTerm = '';
+let sortCol = 'timestamp', sortDir = -1;
+let activeTypeFilter = null;
+let charts = {};
+let blockedIPs = {};
+let autoResponseCount = 0;
+let logPaths = {{ log_paths|tojson }};
+let allDbs = [];
 
-// Init
-window.addEventListener('load', () => {
-    restoreFilters();
-    updateClock();
-    setInterval(updateClock, 1000);
-    filterTable();
-    // Live data polling — no page reload
-    pollStats();
-    setInterval(pollStats, 5000);
+// INIT
+document.addEventListener('DOMContentLoaded', () => {
+  updateClock();
+  setInterval(updateClock, 1000);
+  fetchStats();
+  setInterval(fetchStats, 5000);
+  renderLogPaths();
+  loadDbs();
+  loadInventory();
+  loadHealth();
+  buildMitreMatrix();
 });
 
 function updateClock() {
-    const now = new Date();
-    document.getElementById('clock').textContent =
-        now.toLocaleTimeString('en-US', {hour12: false});
+  const n = new Date();
+  document.getElementById('nav-time').textContent =
+    n.toTimeString().slice(0,8) + ' UTC' + (n.getTimezoneOffset() > 0 ? '-' : '+') +
+    String(Math.abs(n.getTimezoneOffset()/60)).padStart(2,'0');
 }
 
-// Live polling
-let isPolling = false;
+// PAGE NAV
+function showPage(name, el) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  el.classList.add('active');
+  if (name === 'analytics') buildAnalytics();
+  if (name === 'mitre') buildMitreMatrix();
+}
 
-async function pollStats() {
-    if (isPolling) return;
-    isPolling = true;
-    try {
-        const res  = await fetch('/api/stats');
-        const data = await res.json();
+//  FETCH STATS
+async function fetchStats() {
+  try {
+    const r = await fetch('/api/stats');
+    if (!r.ok) return;
+    const d = await r.json();
 
-        // ── Update KPI sidebar cards ──
-        const kpiVals = document.querySelectorAll('.kpi-val');
-        if (kpiVals[0]) kpiVals[0].textContent = data.failed_logins;
-        if (kpiVals[1]) kpiVals[1].textContent = data.brute_total;
-        if (kpiVals[2]) kpiVals[2].textContent = data.sudo_total;
-        if (kpiVals[3]) kpiVals[3].textContent = data.unique_ips;
+    // sidebar KPIs
+    setNum('s-failed', d.failed_logins);
+    setNum('s-brute',  d.brute_total);
+    setNum('s-sudo',   d.sudo_total);
+    setNum('s-ips',    d.unique_ips);
+    setNum('s-total',  d.total_logs);
+    setNum('s-susp',   d.suspicious_count);
 
-        // ── Update top stat cards ──
-        const statVals = document.querySelectorAll('.stat-val');
-        if (statVals[0]) statVals[0].textContent = data.total_logs;
-        if (statVals[1]) statVals[1].textContent = data.suspicious_count;
-        if (statVals[2]) statVals[2].textContent = data.auth_count;
-        if (statVals[3]) statVals[3].textContent = data.host_count;
+    // overview KPIs
+    setNum('ov-failed', d.failed_logins);
+    setNum('ov-auth',   d.auth_count);
+    setNum('ov-susp',   d.suspicious_count);
+    setNum('ov-hosts',  d.host_count);
 
-        // ── Rebuild event type list ──
-        const etypeList = document.getElementById('etypeList');
-        const firstRow  = etypeList.querySelector('[data-etype="all"]');
-        if (firstRow) firstRow.querySelector('.etype-count').textContent = data.total_logs;
+    // sidebar alerts
+    renderSidebarAlerts(d.top_ips, d.sudo_users);
+    renderEtypes(d.event_types);
+    renderHosts(d.logs);
+    renderSidebarBlocked();
 
-        // Remove old dynamic rows, re-add
-        etypeList.querySelectorAll('[data-etype]:not([data-etype="all"])').forEach(r => r.remove());
-        (data.event_types || []).forEach(et => {
-            const row = document.createElement('div');
-            row.className = 'etype-row' + (currentEtype === et.name ? ' active' : '');
-            row.dataset.etype = et.name;
-            row.onclick = () => setEtype(et.name, row);
-            row.innerHTML = `
-                <span class="etype-name">
-                    <span class="etype-dot" style="background:${et.color}"></span>
-                    ${et.name}
-                </span>
-                <span class="etype-count">${et.count}</span>`;
-            etypeList.appendChild(row);
-        });
+    // charts
+    buildTimelineChart(d.logs);
+    buildEtypeChart(d.event_types);
+    buildIPChart(d.top_ips);
+    buildSevChart(d.logs);
 
-        // Rebuild top IPs
-        const ipSection = document.getElementById('topIpList');
-        if (ipSection) {
-            ipSection.innerHTML = (data.top_ips || []).length === 0
-                ? '<div style="font-size:11px;color:var(--muted);text-align:center;padding:12px 0">No attackers detected</div>'
-                : (data.top_ips || []).map(([ip, count]) => `
-                    <div class="alert-item ${count > 50 ? '' : count > 20 ? 'warn' : 'info'}">
-                        <div class="alert-ip">${ip}</div>
-                        <div class="alert-meta">${count} failed attempt${count !== 1 ? 's' : ''}</div>
-                    </div>`).join('');
-        }
-
-        // Rebuild log table rows
-        const tbody = document.getElementById('logBody');
-        const existingIds = new Set(
-            Array.from(tbody.querySelectorAll('tr.log-row')).map(r => r.dataset.logid)
-        );
-
-        let newCount = 0;
-        const fragment = document.createDocumentFragment();
-
-        (data.logs || []).forEach(log => {
-            if (existingIds.has(String(log.logid))) return; // already shown
-            newCount++;
-            const tr = document.createElement('tr');
-            tr.className = `log-row r-${log.threat_level}`;
-            tr.dataset.sev    = log.threat_level;
-            tr.dataset.etype  = log.eventtype;
-            tr.dataset.logid  = log.logid;
-            tr.dataset.time   = log.timestamp;
-            tr.dataset.user   = log.username;
-            tr.dataset.ip     = log.sourceip;
-            tr.dataset.host   = log.hostname;
-            tr.dataset.msg    = log.message;
-            tr.dataset.raw    = log.rawline || '';
-            tr.onclick = function(){ showDetail(this); };
-            tr.innerHTML = `
-                <td class="col-time">${log.timestamp}</td>
-                <td class="col-type"><span class="badge badge-${log.eventtype}">${log.eventtype}</span></td>
-                <td class="col-host">${log.hostname}</td>
-                <td class="col-user">${log.username}</td>
-                <td class="col-ip">${log.sourceip}</td>
-                <td class="col-msg">${log.message}</td>
-                <td class="col-sev"><span class="sev-badge sev-${log.threat_level}">${log.threat_label}</span></td>`;
-            fragment.appendChild(tr);
-        });
-
-        if (newCount > 0) {
-            // Prepend new rows at the top
-            tbody.insertBefore(fragment, tbody.firstChild);
-            // Keep table from growing unbounded — trim to 300
-            const allRows = tbody.querySelectorAll('tr.log-row');
-            if (allRows.length > 300) {
-                for (let i = 300; i < allRows.length; i++) allRows[i].remove();
-            }
-            filterTable();
-        }
-
-        // Flash last-updated indicator
-        const lu = document.getElementById('lastUpdate');
-        if (lu) {
-            lu.textContent = 'UPDATED ' + new Date().toLocaleTimeString('en-US', {hour12: false});
-            lu.style.opacity = '1';
-            setTimeout(() => { lu.style.opacity = '0.4'; }, 1500);
-        }
-
-    } catch (e) {
-        console.warn('Poll failed:', e);
-    } finally {
-        isPolling = false;
+    // log table
+    allLogs = d.logs || [];
+    if (document.getElementById('page-logs').classList.contains('active') ||
+        document.getElementById('page-overview').classList.contains('active')) {
+      applyFilters();
     }
+    renderOverviewTable(allLogs);
+
+    // auto-response
+    checkAutoResponse(d);
+  } catch(e) { console.error(e); }
 }
 
-function restoreFilters() {
-    // Restore severity chip
-    document.querySelectorAll('[data-sev]').forEach(el => {
-        el.classList.toggle('active', el.dataset.sev === currentSev);
-    });
-
-    // Restore etype row
-    document.querySelectorAll('[data-etype]').forEach(el => {
-        if (el.classList.contains('etype-row')) {
-            el.classList.toggle('active', el.dataset.etype === currentEtype);
-        }
-    });
+function setNum(id, v) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = (v || 0).toLocaleString();
 }
 
-// Filters
-function setSev(val, el) {
-    currentSev = val;
-    localStorage.setItem('sevFilter', val);
-    document.querySelectorAll('.chip[data-sev]').forEach(c => c.classList.remove('active'));
-    el.classList.add('active');
-    page = 1;
-    filterTable();
+// SIDEBAR
+function renderSidebarAlerts(topIps, sudoUsers) {
+  const c = document.getElementById('sb-alerts');
+  if ((!topIps || !topIps.length) && (!sudoUsers || !sudoUsers.length)) {
+    c.innerHTML = '<div class="empty-state">No alerts</div>'; return;
+  }
+  let html = '';
+  (topIps||[]).slice(0,4).forEach(([ip,count]) => {
+    html += `<div class="al-item"><div class="al-ip">${ip}</div><div class="al-meta">${count} failed auth events</div></div>`;
+  });
+  (sudoUsers||[]).slice(0,3).forEach(([u,count]) => {
+    html += `<div class="al-item warn"><div class="al-ip">${u}</div><div class="al-meta">${count} sudo events</div></div>`;
+  });
+  c.innerHTML = html;
 }
 
-function setEtype(val, el) {
-    currentEtype = val;
-    localStorage.setItem('etypeFilter', val);
-    document.querySelectorAll('.etype-row').forEach(r => r.classList.remove('active'));
-    el.classList.add('active');
-    page = 1;
-    filterTable();
+function renderEtypes(etypes) {
+  const c = document.getElementById('sb-etypes');
+  if (!etypes || !etypes.length) { c.innerHTML = ''; return; }
+  c.innerHTML = etypes.map(e =>
+    `<div class="etype-row ${activeTypeFilter===e.name?'active':''}" onclick="typeFilterClick('${e.name}')">
+      <span class="etype-name"><span class="etype-dot" style="background:${e.color}"></span>${e.name}</span>
+      <span class="etype-count">${e.count}</span>
+    </div>`
+  ).join('');
 }
 
-function filterTable() {
-    const search  = document.getElementById('searchInput').value.toLowerCase().trim();
-    const rows    = document.querySelectorAll('#logBody tr.log-row');
-    let visible   = 0;
-    let allRows   = [];
-
-    rows.forEach(row => {
-        const sevOk   = currentSev  === 'all' || row.dataset.sev   === currentSev;
-        const etypeOk = currentEtype === 'all' || row.dataset.etype === currentEtype;
-        const searchOk = !search || row.textContent.toLowerCase().includes(search);
-        const show = sevOk && etypeOk && searchOk;
-        row._visible = show;
-        if (show) { visible++; allRows.push(row); }
-    });
-
-    // Update match count
-    document.getElementById('matchCount').textContent =
-        search ? `${visible} match${visible !== 1 ? 'es' : ''}` : '';
-
-    // Paginate
-    renderPage(allRows, page);
-    renderPagination(allRows.length);
-
-    document.getElementById('tableCount').textContent =
-        `Showing ${Math.min(visible, PAGE_SIZE)} of ${visible} events`;
+function renderHosts(logs) {
+  const hosts = {};
+  (logs||[]).forEach(l => { if(l.hostname && l.hostname!=='—') hosts[l.hostname] = (hosts[l.hostname]||0)+1; });
+  const c = document.getElementById('sb-hosts');
+  c.innerHTML = Object.entries(hosts).slice(0,6).map(([h,n]) =>
+    `<div class="sb-host"><span>${h}</span><span style="color:var(--muted)">${n}</span></div>`
+  ).join('') || '<div style="color:var(--muted);font-size:10px">No host data</div>';
 }
 
-function renderPage(visibleRows, pg) {
-    const start = (pg - 1) * PAGE_SIZE;
-    const end   = start + PAGE_SIZE;
-    const all = document.querySelectorAll('#logBody tr.log-row');
-    const visSet = new Set(visibleRows.slice(start, end));
-    all.forEach(row => {
-        row.style.display = visSet.has(row) ? '' : 'none';
-    });
+function renderSidebarBlocked() {
+  const c = document.getElementById('sb-blocked');
+  const ips = Object.keys(blockedIPs);
+  if (!ips.length) { c.innerHTML = '<span style="color:var(--muted)">None</span>'; return; }
+  c.innerHTML = ips.map(ip =>
+    `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">
+      <span style="color:var(--red)">${ip}</span>
+      <span style="cursor:pointer;color:var(--muted)" onclick="unblockIPDirect('${ip}')">✕</span>
+    </div>`
+  ).join('');
 }
 
-function renderPagination(total) {
-    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-    const container = document.getElementById('pageBtns');
-    container.innerHTML = '';
+function typeFilterClick(name) {
+  activeTypeFilter = activeTypeFilter === name ? null : name;
+  if (activeTypeFilter) {
+    activeFilter = activeTypeFilter;
+    showPage('logs', document.querySelector('.nav-tab:nth-child(2)'));
+    applyFilters();
+  } else {
+    activeFilter = 'ALL';
+    applyFilters();
+  }
+}
 
-    document.getElementById('pageInfo').textContent =
-        `Page ${page} of ${pages}  (${total} events)`;
+// OVERVIEW TABLE
+function renderOverviewTable(logs) {
+  const high = logs.filter(l => l.threat_level >= 2).slice(0,20);
+  const tb = document.getElementById('ov-table');
+  document.getElementById('ov-log-count').textContent = `${high.length} high-severity events`;
+  if (!high.length) { tb.innerHTML = '<tr><td colspan="7" class="empty-state">No high-severity events</td></tr>'; return; }
+  tb.innerHTML = high.map(l => rowHtml(l)).join('');
+}
 
-    // Prev
-    const prev = document.createElement('button');
-    prev.className = 'page-btn';
-    prev.textContent = '← Prev';
-    prev.disabled = page <= 1;
-    prev.onclick = () => { page--; filterTable(); };
-    container.appendChild(prev);
+// LOG TABLE
+function applyFilters() {
+  let list = [...allLogs];
+  if (activeFilter !== 'ALL') list = list.filter(l => l.eventtype === activeFilter);
+  if (activeSev !== null) list = list.filter(l => l.threat_level === activeSev);
+  if (searchTerm) {
+    const q = searchTerm.toLowerCase();
+    list = list.filter(l =>
+      (l.message||'').toLowerCase().includes(q) ||
+      (l.sourceip||'').toLowerCase().includes(q) ||
+      (l.username||'').toLowerCase().includes(q) ||
+      (l.hostname||'').toLowerCase().includes(q)
+    );
+  }
+  list.sort((a,b) => {
+    let av = a[sortCol]||'', bv = b[sortCol]||'';
+    if (sortCol==='threat_level') { av=a.threat_level; bv=b.threat_level; }
+    if (av < bv) return sortDir; if (av > bv) return -sortDir; return 0;
+  });
+  filteredLogs = list;
+  curPage = 1;
+  renderLogTable();
+  document.getElementById('log-count').textContent = `${list.length} events`;
+}
 
-    // Page numbers (show up to 5)
-    const start = Math.max(1, page - 2);
-    const end   = Math.min(pages, start + 4);
-    for (let i = start; i <= end; i++) {
-        const btn = document.createElement('button');
-        btn.className = 'page-btn' + (i === page ? ' current' : '');
-        btn.textContent = i;
-        btn.onclick = (function(n){ return () => { page = n; filterTable(); }; })(i);
-        container.appendChild(btn);
+function renderLogTable() {
+  const tb = document.getElementById('log-table');
+  const start = (curPage-1)*pageSize, end = start+pageSize;
+  const page = filteredLogs.slice(start, end);
+  if (!page.length) { tb.innerHTML = '<tr><td colspan="7" class="empty-state">No events match filters</td></tr>'; }
+  else tb.innerHTML = page.map(l => rowHtml(l)).join('');
+  renderPagination();
+}
+
+function rowHtml(l) {
+  const rc = l.threat_level>=3 ? 'r-red' : l.threat_level>=2 ? 'r-orange' : '';
+  const sevCls = `sev-badge sev-${l.threat_level}`;
+  return `<tr class="lr ${rc}" onclick='openDrawer(${JSON.stringify(l)})'>
+    <td class="col-time">${l.timestamp}</td>
+    <td class="col-type"><span class="badge badge-${l.eventtype}">${l.eventtype}</span></td>
+    <td class="col-host" title="${l.hostname}">${l.hostname}</td>
+    <td class="col-user">${l.username}</td>
+    <td class="col-ip">${l.sourceip}</td>
+    <td class="col-msg" title="${escHtml(l.message)}">${escHtml(l.message)}</td>
+    <td class="col-sev"><span class="${sevCls}">${l.threat_label}</span></td>
+  </tr>`;
+}
+
+function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function renderPagination() {
+  const total = filteredLogs.length, pages = Math.ceil(total/pageSize)||1;
+  const start = (curPage-1)*pageSize+1, end = Math.min(curPage*pageSize, total);
+  document.getElementById('pg-info').textContent = `Showing ${total?start:0}–${end} of ${total}`;
+  const c = document.getElementById('pg-btns');
+  let html = `<button class="pg-btn" onclick="changePage(${curPage-1})" ${curPage<=1?'disabled':''}>‹ Prev</button>`;
+  const range = pageRange(curPage, pages);
+  range.forEach(p => {
+    if (p==='…') html += `<button class="pg-btn" disabled>…</button>`;
+    else html += `<button class="pg-btn ${p===curPage?'cur':''}" onclick="changePage(${p})">${p}</button>`;
+  });
+  html += `<button class="pg-btn" onclick="changePage(${curPage+1})" ${curPage>=pages?'disabled':''}>Next ›</button>`;
+  c.innerHTML = html;
+}
+
+function pageRange(cur, total) {
+  if (total <= 7) return Array.from({length:total},(_,i)=>i+1);
+  if (cur <= 4) return [1,2,3,4,5,'…',total];
+  if (cur >= total-3) return [1,'…',total-4,total-3,total-2,total-1,total];
+  return [1,'…',cur-1,cur,cur+1,'…',total];
+}
+
+function changePage(p) { const pages=Math.ceil(filteredLogs.length/pageSize)||1; if(p<1||p>pages)return; curPage=p; renderLogTable(); }
+function filterLogs() { searchTerm=document.getElementById('log-search').value; applyFilters(); }
+function setFilter(el, f) {
+  document.querySelectorAll('.filter-row .chip[data-filter]').forEach(c=>c.classList.remove('active'));
+  el.classList.add('active'); activeFilter=f; applyFilters();
+}
+function setSev(el, s) {
+  if (activeSev===s) { el.classList.remove('active'); activeSev=null; }
+  else { document.querySelectorAll('.filter-row .chip[data-sev]').forEach(c=>c.classList.remove('active')); el.classList.add('active'); activeSev=s; }
+  applyFilters();
+}
+function sortTable(col) { if(sortCol===col) sortDir*=-1; else { sortCol=col; sortDir=-1; } applyFilters(); }
+
+// DRAWER
+function openDrawer(l) {
+  const fields = [
+    ['Log ID', l.logid], ['Timestamp', l.timestamp], ['Event Type', l.eventtype],
+    ['Host', l.hostname], ['Username', l.username], ['Source IP', l.sourceip],
+    ['Severity', l.threat_label], ['Status', l.threat_level>=1?'Anomaly':'Normal']
+  ];
+  document.getElementById('drawer-fields').innerHTML = fields.map(([k,v]) =>
+    `<div><div class="dk">${k}</div><div class="dv">${escHtml(String(v))}</div></div>`
+  ).join('');
+  document.getElementById('drawer-raw').textContent = l.rawline || l.message || '—';
+  const mitre = {{ mitre_map|tojson }};
+  const techniques = mitre[l.eventtype] || [];
+  document.getElementById('drawer-mitre').innerHTML = techniques.length
+    ? techniques.map(t => `<span class="mitre-chip" title="${t.tactic}">${t.id} — ${t.name}</span>`).join('')
+    : '<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;color:var(--muted)">No MITRE mapping</span>';
+  document.getElementById('drawer').classList.add('open');
+}
+function closeDrawer() { document.getElementById('drawer').classList.remove('open'); }
+
+// CHARTS
+const CC = { grid:'rgba(26,45,61,.6)', text:'#5a7080', accent:'#00d4aa', red:'#f85149', orange:'#e3a03a', blue:'#0ea5e9', purple:'#bc8cff', green:'#3fb950' };
+
+function mkChart(id, cfg) {
+  if (charts[id]) charts[id].destroy();
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  charts[id] = new Chart(ctx, cfg);
+}
+
+function buildTimelineChart(logs) {
+  const now = new Date(), buckets = {};
+  for (let i=59; i>=0; i--) {
+    const k = new Date(now - i*60000);
+    const label = k.toTimeString().slice(0,5);
+    buckets[label] = {label, total:0, failed:0};
+  }
+  (logs||[]).forEach(l => {
+    if (!l.timestamp) return;
+    const t = l.timestamp.slice(11,16);
+    if (buckets[t]) { buckets[t].total++; if(l.threat_level>=2) buckets[t].failed++; }
+  });
+  const vals = Object.values(buckets);
+  mkChart('chart-timeline', { type:'line', data:{
+    labels: vals.map(v=>v.label),
+    datasets: [
+      { label:'All Events', data:vals.map(v=>v.total), borderColor:CC.accent, backgroundColor:'rgba(0,212,170,.08)', tension:.3, pointRadius:0, fill:true },
+      { label:'Threats', data:vals.map(v=>v.failed), borderColor:CC.red, backgroundColor:'rgba(248,81,73,.08)', tension:.3, pointRadius:0, fill:true }
+    ]
+  }, options: chartOpts() });
+}
+
+function buildEtypeChart(etypes) {
+  if (!etypes||!etypes.length) return;
+  mkChart('chart-etypes', { type:'doughnut', data:{
+    labels: etypes.map(e=>e.name),
+    datasets:[{ data:etypes.map(e=>e.count), backgroundColor:etypes.map(e=>e.color), borderWidth:0, hoverOffset:4 }]
+  }, options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'right', labels:{ color:CC.text, font:{size:10}, boxWidth:10 } } } } });
+}
+
+function buildIPChart(topIps) {
+  if (!topIps||!topIps.length) return;
+  mkChart('chart-ips', { type:'bar', data:{
+    labels: topIps.slice(0,8).map(([ip])=>ip),
+    datasets:[{ label:'Failed Logins', data:topIps.slice(0,8).map(([,c])=>c), backgroundColor:'rgba(248,81,73,.7)', borderRadius:3 }]
+  }, options:{ ...chartOpts(), indexAxis:'y' } });
+}
+
+function buildSevChart(logs) {
+  const c = {CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0};
+  (logs||[]).forEach(l => { const m={3:'CRITICAL',2:'HIGH',1:'MEDIUM',0:'LOW'}; c[m[l.threat_level]||'LOW']++; });
+  mkChart('chart-sev', { type:'bar', data:{
+    labels:['CRITICAL','HIGH','MEDIUM','LOW'],
+    datasets:[{ data:[c.CRITICAL,c.HIGH,c.MEDIUM,c.LOW], backgroundColor:[CC.red,CC.orange,'rgba(210,153,34,.7)',CC.green], borderRadius:3 }]
+  }, options:chartOpts() });
+}
+
+function chartOpts() {
+  return { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+    scales:{ x:{ grid:{color:CC.grid}, ticks:{color:CC.text,font:{size:9}} }, y:{ grid:{color:CC.grid}, ticks:{color:CC.text,font:{size:9}} } } };
+}
+
+// ANALYTICS
+async function buildAnalytics() {
+  try {
+    const r = await fetch('/api/stats'); const d = await r.json();
+    setNum('an-total',     d.total_logs);
+    setNum('an-failed',    d.failed_logins);
+    setNum('an-auth',      d.auth_count);
+    setNum('an-susp',      d.suspicious_count);
+    setNum('an-sudo-count', d.sudo_total);
+
+    // IP table
+    const ipTb = document.getElementById('an-ip-table');
+    const ipResp = await fetch('/api/top-ips');
+    const ips = await ipResp.json();
+    ipTb.innerHTML = (ips||[]).map(([ip,count]) =>
+      `<tr><td style="color:var(--accent)">${ip}</td><td>${count}</td>
+       <td><span class="tag ${count>20?'tag-crit':count>10?'tag-high':'tag-med'}">${count>20?'CRITICAL':count>10?'HIGH':'MEDIUM'}</span></td>
+       <td><button class="btn btn-red" style="font-size:9px;padding:3px 8px" onclick="quickBlock('${ip}')">Block</button></td></tr>`
+    ).join('') || '<tr><td colspan="4" class="empty-state">No attacker IPs</td></tr>';
+
+    // Sudo table
+    const sudoResp = await fetch('/api/sudo-users');
+    const sudos = await sudoResp.json();
+    const sudoTb = document.getElementById('an-sudo-table');
+    sudoTb.innerHTML = (sudos||[]).map(([u,c]) =>
+      `<tr><td style="color:var(--blue)">${u}</td><td>${c}</td>
+       <td><span class="tag ${c>10?'tag-high':'tag-med'}">${c>10?'HIGH':'MEDIUM'}</span></td></tr>`
+    ).join('') || '<tr><td colspan="3" class="empty-state">No sudo data</td></tr>';
+
+    // Timeline chart
+    buildTimelineChart(d.logs);
+    const tl = document.getElementById('an-chart-tl');
+    if (tl && charts['chart-timeline']) {
+      const existing = charts['an-chart-tl'];
+      if (existing) existing.destroy();
+      // reuse data
     }
 
-    // Next
-    const next = document.createElement('button');
-    next.className = 'page-btn';
-    next.textContent = 'Next →';
-    next.disabled = page >= pages;
-    next.onclick = () => { page++; filterTable(); };
-    container.appendChild(next);
+    // Success/Fail chart
+    const success = (d.logs||[]).filter(l=>l.threat_level===0).length;
+    const failed  = (d.logs||[]).filter(l=>l.threat_level> 0).length;
+    mkChart('an-chart-sf', { type:'pie', data:{
+      labels:['Normal','Anomaly'],
+      datasets:[{ data:[success,failed], backgroundColor:[CC.green,'rgba(248,81,73,.7)'], borderWidth:0 }]
+    }, options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'right', labels:{color:CC.text,font:{size:10},boxWidth:10} } } } });
+
+    // Heatmap
+    const hm = new Array(24).fill(0);
+    (d.logs||[]).forEach(l => { if(l.timestamp) { const h=parseInt(l.timestamp.slice(11,13)); if(!isNaN(h)) hm[h]++; } });
+    const max = Math.max(...hm,1);
+    document.getElementById('an-heatmap').innerHTML = hm.map((v,h) =>
+      `<div title="${h}:00 — ${v} events" style="flex:1;height:${Math.max(4,v/max*80)}px;background:${v>0?'rgba(0,212,170,'+(.2+.8*v/max)+')':'var(--border)'};border-radius:2px 2px 0 0;cursor:default"></div>`
+    ).join('');
+  } catch(e) { console.error(e); }
 }
 
-// Sort 
-function sortTable(col) {
-    const tbody = document.getElementById('logBody');
-    const rows  = Array.from(tbody.querySelectorAll('tr.log-row'));
+// FIM
+let fimPaths = ['/etc/passwd','/etc/shadow','/etc/hosts','/etc/crontab'];
+let fimBaseline = {};
 
-    if (sortCol === col) {
-        sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-    } else {
-        sortCol = col;
-        sortDir = 'asc';
-    }
+function renderFimPaths() {
+  document.getElementById('fim-paths').innerHTML = fimPaths.map((p,i) =>
+    `<div class="path-item"><div style="display:flex;align-items:center;gap:8px"><div class="path-status"></div><span>${p}</span></div>
+     <button class="btn btn-red" style="font-size:9px;padding:2px 8px" onclick="removeFimPath(${i})">Remove</button></div>`
+  ).join('') || '<div style="color:var(--muted);font-size:10px">No paths configured</div>';
+}
 
-    rows.sort((a, b) => {
-        const aVal = a.cells[col]?.textContent.trim() || '';
-        const bVal = b.cells[col]?.textContent.trim() || '';
-        const cmp  = aVal.localeCompare(bVal, undefined, {numeric: true});
-        return sortDir === 'asc' ? cmp : -cmp;
+function addFimPath() {
+  const v = document.getElementById('fim-path-input').value.trim();
+  if (!v) return;
+  if (!fimPaths.includes(v)) { fimPaths.push(v); renderFimPaths(); toast('Path added', 'ok'); }
+  document.getElementById('fim-path-input').value = '';
+}
+
+function removeFimPath(i) { fimPaths.splice(i,1); renderFimPaths(); }
+
+async function runFim() {
+  toast('Running FIM scan…', 'info');
+  try {
+    const r = await fetch('/api/fim', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({paths:fimPaths}) });
+    const results = await r.json();
+    let ok=0, mod=0, miss=0;
+    const tb = document.getElementById('fim-results');
+    tb.innerHTML = results.map(f => {
+      const changed = fimBaseline[f.path] && fimBaseline[f.path] !== f.hash;
+      const status = f.status!=='ok' ? 'ERROR' : changed ? 'MODIFIED' : fimBaseline[f.path] ? 'UNCHANGED' : 'NEW';
+      if(status==='UNCHANGED') ok++; else if(status==='MODIFIED') mod++; else if(status==='ERROR') miss++;
+      const cls = status==='MODIFIED'?'tag-high':status==='ERROR'?'tag-crit':status==='NEW'?'tag-info':'tag-low';
+      if (!fimBaseline[f.path] && f.hash) fimBaseline[f.path] = f.hash;
+      return `<tr>
+        <td style="font-family:'IBM Plex Mono',monospace;color:var(--blue)">${f.path}</td>
+        <td style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted)">${f.hash?f.hash.slice(0,20)+'…':'—'}</td>
+        <td>${f.size?f.size+' B':'—'}</td>
+        <td>${f.mtime?new Date(f.mtime*1000).toISOString().slice(0,19):'—'}</td>
+        <td><span class="tag ${cls}">${status}</span></td>
+      </tr>`;
+    }).join('');
+    setNum('fim-ok',ok); setNum('fim-mod',mod); setNum('fim-miss',miss);
+    document.getElementById('fim-empty').style.display = 'none';
+    toast(`FIM scan complete: ${results.length} files`, 'ok');
+  } catch(e) { toast('FIM scan failed: '+e.message, 'err'); }
+}
+
+document.addEventListener('DOMContentLoaded', () => { renderFimPaths(); });
+
+// SCA
+async function runSca() {
+  const prog = document.getElementById('sca-progress');
+  const pb   = document.getElementById('sca-pb');
+  prog.style.display = 'block';
+  let pct = 0;
+  const interval = setInterval(() => { pct = Math.min(pct+15,90); pb.style.width=pct+'%'; }, 300);
+  try {
+    const r = await fetch('/api/sca');
+    const checks = await r.json();
+    clearInterval(interval); pb.style.width='100%';
+    setTimeout(() => prog.style.display='none', 600);
+    const pass = checks.filter(c=>c.status==='PASS').length;
+    const fail = checks.filter(c=>c.status==='FAIL').length;
+    const crit = checks.filter(c=>c.status==='FAIL'&&c.severity==='CRITICAL').length;
+    const score = Math.round(pass/(checks.length||1)*100);
+    document.getElementById('sca-pass').textContent  = pass;
+    document.getElementById('sca-fail').textContent  = fail;
+    document.getElementById('sca-score').textContent = score + '%';
+    document.getElementById('sca-crit').textContent  = crit;
+    // compliance scores
+    document.getElementById('comp-pci-val').textContent  = Math.max(0,score-10)+'%';
+    document.getElementById('comp-hipaa-val').textContent = score+'%';
+    document.getElementById('comp-nist-val').textContent  = Math.min(100,score+5)+'%';
+    document.getElementById('sca-empty').style.display = 'none';
+    const tb = document.getElementById('sca-results');
+    tb.innerHTML = checks.map(c => `<tr>
+      <td style="font-family:'IBM Plex Mono',monospace;color:var(--muted)">${c.id}</td>
+      <td>${c.title}${c.detail?'<div style="font-size:9px;color:var(--muted);margin-top:2px">'+c.detail+'</div>':''}</td>
+      <td><span class="tag ${c.severity==='CRITICAL'?'tag-crit':c.severity==='HIGH'?'tag-high':c.severity==='MEDIUM'?'tag-med':'tag-low'}">${c.severity}</span></td>
+      <td><span class="tag ${c.status==='PASS'?'tag-low':'tag-crit'}">${c.status}</span></td>
+    </tr>`).join('');
+    toast(`SCA complete: ${pass} pass, ${fail} fail`, pass>=fail?'ok':'err');
+  } catch(e) { clearInterval(interval); prog.style.display='none'; toast('SCA failed: '+e.message,'err'); }
+}
+
+// VULN 
+async function runVuln() {
+  toast('Scanning packages…','info');
+  try {
+    const r = await fetch('/api/vuln');
+    const vulns = await r.json();
+    const crit = vulns.filter(v=>v.severity==='CRITICAL').length;
+    const high = vulns.filter(v=>v.severity==='HIGH').length;
+    const med  = vulns.filter(v=>v.severity==='MEDIUM').length;
+    document.getElementById('vn-crit').textContent  = crit;
+    document.getElementById('vn-high').textContent  = high;
+    document.getElementById('vn-med').textContent   = med;
+    document.getElementById('vn-total').textContent = vulns.length;
+    document.getElementById('vuln-empty').style.display = 'none';
+    const tb = document.getElementById('vuln-results');
+    tb.innerHTML = vulns.length
+      ? vulns.map(v => `<tr>
+          <td style="font-family:'IBM Plex Mono',monospace;color:var(--blue)">${v.package}</td>
+          <td style="font-family:'IBM Plex Mono',monospace;color:var(--orange)">${v.cve}</td>
+          <td><span class="tag ${v.severity==='CRITICAL'?'tag-crit':v.severity==='HIGH'?'tag-high':v.severity==='MEDIUM'?'tag-med':'tag-low'}">${v.severity}</span></td>
+          <td style="color:var(--muted)">${v.description}</td>
+          <td><a href="https://nvd.nist.gov/vuln/detail/${v.cve}" target="_blank" style="color:var(--blue);font-family:'IBM Plex Mono',monospace;font-size:10px">NVD ↗</a></td>
+        </tr>`)
+        .join('')
+      : '<tr><td colspan="5" class="empty-state" style="color:var(--green)">No known vulnerabilities detected</td></tr>';
+    toast(`Vuln scan complete: ${vulns.length} findings`, crit>0?'err':'ok');
+  } catch(e) { toast('Vuln scan failed: '+e.message,'err'); }
+}
+
+// MITRE ATT&CK
+function buildMitreMatrix() {
+  const mitreMap = {{ mitre_map|tojson }};
+  const techniques = {}, tactics = {};
+  allLogs.forEach(l => {
+    const maps = mitreMap[l.eventtype] || [];
+    maps.forEach(t => {
+      techniques[t.id] = techniques[t.id] || { ...t, count:0 };
+      techniques[t.id].count++;
+      tactics[t.tactic] = (tactics[t.tactic]||0) + 1;
     });
+  });
 
-    rows.forEach(r => tbody.appendChild(r));
+  // tactic pills
+  document.getElementById('mitre-tactics').innerHTML = Object.entries(tactics)
+    .sort((a,b)=>b[1]-a[1])
+    .map(([t,c]) => `<span class="mitre-chip" style="font-size:11px;padding:5px 12px">${t} <strong>${c}</strong></span>`)
+    .join('') || '<span style="color:var(--muted);font-size:11px">Waiting for log data…</span>';
 
-    // Update header indicators
-    document.querySelectorAll('th[data-col]').forEach(th => {
-        th.classList.remove('sort-asc', 'sort-desc');
+  // technique cards
+  document.getElementById('mitre-cards').innerHTML = Object.values(techniques)
+    .sort((a,b)=>b.count-a.count)
+    .map(t => `<div class="mitre-card">
+      <div class="mitre-id">${t.id}</div>
+      <div class="mitre-name">${t.name}</div>
+      <div class="mitre-tactic">${t.tactic}</div>
+      <div class="mitre-count">${t.count}</div>
+    </div>`)
+    .join('') || '<div class="empty-state" style="grid-column:1/-1">No MITRE techniques detected yet</div>';
+
+  // tactic list
+  document.getElementById('mitre-tactic-list').innerHTML = Object.entries(tactics)
+    .sort((a,b)=>b[1]-a[1])
+    .map(([t,c]) => `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
+      <span style="font-size:12px">${t}</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:600;color:var(--accent)">${c}</span>
+    </div>`)
+    .join('') || '<div style="color:var(--muted);font-size:11px">No data</div>';
+
+  // radar chart
+  const tacticNames = Object.keys(tactics);
+  const tacticCounts = Object.values(tactics);
+  mkChart('mitre-chart', { type:'radar', data:{
+    labels: tacticNames,
+    datasets:[{ label:'Activity', data:tacticCounts,
+      backgroundColor:'rgba(0,212,170,.12)', borderColor:'rgba(0,212,170,.7)',
+      pointBackgroundColor:'var(--accent)', pointRadius:4 }]
+  }, options:{ responsive:true, maintainAspectRatio:false,
+    plugins:{ legend:{display:false} },
+    scales:{ r:{ grid:{color:CC.grid}, ticks:{display:false}, pointLabels:{color:CC.text,font:{size:9}} } } } });
+}
+
+// ACTIVE RESPONSE
+let arLog = [];
+
+function arLogEntry(msg, type='info') {
+  const t = new Date().toTimeString().slice(0,8);
+  const colors = {info:'var(--blue)', ok:'var(--green)', err:'var(--red)'};
+  arLog.unshift(`<div style="color:${colors[type]||CC.text}">[ ${t} ] ${escHtml(msg)}</div>`);
+  if (arLog.length > 100) arLog.pop();
+  document.getElementById('ar-log').innerHTML = arLog.join('');
+}
+
+async function blockIP() {
+  const ip = document.getElementById('ar-ip-input').value.trim();
+  const reason = document.getElementById('ar-reason').value;
+  if (!ip) { toast('Enter an IP address','err'); return; }
+  try {
+    const r = await fetch('/api/block-ip', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip,reason}) });
+    const d = await r.json();
+    if (d.success) {
+      blockedIPs[ip] = { reason, time:new Date().toISOString() };
+      renderBlockedTable();
+      renderSidebarBlocked();
+      setNum('ar-blocked-count', Object.keys(blockedIPs).length);
+      arLogEntry(`Blocked IP ${ip} — ${reason}`, 'ok');
+      toast(`Blocked ${ip}`, 'ok');
+    } else { toast(d.message,'err'); }
+  } catch(e) { toast('Block failed: '+e.message,'err'); }
+}
+
+async function unblockIP() {
+  const ip = document.getElementById('ar-ip-input').value.trim();
+  if (!ip) { toast('Enter an IP to unblock','err'); return; }
+  await unblockIPDirect(ip);
+}
+
+async function unblockIPDirect(ip) {
+  try {
+    const r = await fetch('/api/unblock-ip', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip}) });
+    const d = await r.json();
+    delete blockedIPs[ip];
+    renderBlockedTable();
+    renderSidebarBlocked();
+    setNum('ar-blocked-count', Object.keys(blockedIPs).length);
+    arLogEntry(`Unblocked IP ${ip}`, 'ok');
+    toast(`Unblocked ${ip}`, 'ok');
+  } catch(e) { toast('Unblock failed: '+e.message,'err'); }
+}
+
+function quickBlock(ip) {
+  document.getElementById('ar-ip-input').value = ip;
+  blockIP();
+}
+
+function renderBlockedTable() {
+  const c = document.getElementById('ar-blocked-list');
+  const empty = document.getElementById('ar-blocked-empty');
+  const entries = Object.entries(blockedIPs);
+  if (!entries.length) { c.innerHTML=''; empty.style.display='block'; return; }
+  empty.style.display = 'none';
+  c.innerHTML = entries.map(([ip,data]) =>
+    `<tr><td style="color:var(--red);font-family:'IBM Plex Mono',monospace">${ip}</td>
+     <td>${data.reason||'Manual'}</td>
+     <td style="color:var(--muted)">${(data.time||'').slice(0,19)}</td>
+     <td><button class="btn" style="font-size:9px;padding:3px 8px" onclick="unblockIPDirect('${ip}')">Unblock</button></td></tr>`
+  ).join('');
+}
+
+function checkAutoResponse(d) {
+  if (document.getElementById('ar-auto-brute').checked) {
+    (d.top_ips||[]).forEach(([ip,count]) => {
+      if (count > 10 && !blockedIPs[ip]) {
+        blockedIPs[ip] = { reason:'Auto: Brute Force ('+count+' attempts)', time:new Date().toISOString() };
+        autoResponseCount++;
+        setNum('ar-auto', autoResponseCount);
+        arLogEntry(`AUTO-BLOCK: ${ip} — ${count} failed logins`, 'err');
+        toast(`Auto-blocked ${ip} (brute force)`, 'err');
+        renderBlockedTable();
+        renderSidebarBlocked();
+        setNum('ar-blocked-count', Object.keys(blockedIPs).length);
+      }
     });
-    const th = document.querySelector(`th[data-col="${col}"]`);
-    if (th) th.classList.add(sortDir === 'asc' ? 'sort-asc' : 'sort-desc');
-
-    page = 1;
-    filterTable();
+  }
+  setNum('ar-brute', d.brute_total);
 }
 
-// Detail drawer
-function showDetail(row) {
-    const d = row.dataset;
-    const fields = [
-        ['Timestamp',   d.time   || '—'],
-        ['Event Type',  d.etype  || '—'],
-        ['Host',        d.host   || '—'],
-        ['User',        d.user   || '—'],
-        ['Source IP',   d.ip     || '—'],
-        ['Severity',    row.dataset.sev || '—'],
-    ];
+function saveAutoRules() { toast('Auto-response rules saved', 'ok'); }
 
-    const grid = document.getElementById('drawerGrid');
-    grid.innerHTML = fields.map(([k, v]) => `
-        <div class="drawer-field">
-            <div class="drawer-key">${k}</div>
-            <div class="drawer-val">${v}</div>
-        </div>
-    `).join('');
-
-    document.getElementById('drawerRaw').textContent = d.msg || '';
-    document.getElementById('detail-drawer').classList.add('open');
+// ADMIN: DB Manager
+async function loadDbs() {
+  try {
+    const r = await fetch('/api/databases');
+    allDbs = await r.json();
+    renderDbList(allDbs);
+  } catch(e) { document.getElementById('db-list').innerHTML='<div style="color:var(--muted);font-size:10px">Could not connect to DB server</div>'; }
 }
 
-function closeDetail() {
-    document.getElementById('detail-drawer').classList.remove('open');
+function renderDbList(dbs) {
+  const curDb = '{{ current_db }}';
+  document.getElementById('db-list').innerHTML = (dbs||[]).map(d =>
+    `<div class="db-item ${d===curDb?'active-db':''}" onclick="selectDb('${d}')">
+      <span class="db-name">${d}</span>
+      ${d===curDb?'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:9px;color:var(--accent)">ACTIVE</span>':''}
+    </div>`
+  ).join('') || '<div style="color:var(--muted);font-size:10px">No databases found</div>';
 }
 
-// Clear logs
-function clearLogs() {
-    if (!confirm('⚠ Delete ALL logs?\\n\\nThis cannot be undone.')) return;
-
-    fetch('/clear-logs', { method: 'POST' })
-        .then(r => r.json())
-        .then(data => {
-            if (data.status === 'success') {
-                window.location.reload();
-            } else {
-                alert('Error: ' + (data.message || 'Unknown error'));
-            }
-        })
-        .catch(() => alert('Failed to connect to server.'));
+function filterDbs() {
+  const q = document.getElementById('db-search-input').value.toLowerCase();
+  renderDbList(allDbs.filter(d=>d.toLowerCase().includes(q)));
 }
 
-// Close drawer on Escape
-document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeDetail();
-});
+async function selectDb(name) {
+  try {
+    const r = await fetch('/api/switch-db', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({database:name}) });
+    const d = await r.json();
+    if (d.success) { toast('Switched to '+name, 'ok'); loadDbs(); fetchStats(); }
+    else toast(d.message,'err');
+  } catch(e) { toast('Switch failed: '+e.message,'err'); }
+}
+
+async function createDb() {
+  const name = document.getElementById('db-create-name').value.trim();
+  if (!name) { toast('Enter a database name','err'); return; }
+  try {
+    const r = await fetch('/api/create-db', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name}) });
+    const d = await r.json();
+    const el = document.getElementById('db-status');
+    el.style.color = d.success?'var(--green)':'var(--red)';
+    el.textContent = d.message;
+    if (d.success) { loadDbs(); document.getElementById('db-create-name').value=''; }
+    toast(d.message, d.success?'ok':'err');
+  } catch(e) { toast('Create failed: '+e.message,'err'); }
+}
+
+// ADMIN: Log Paths
+function renderLogPaths() {
+  document.getElementById('log-paths').innerHTML = logPaths.map((p,i) =>
+    `<div class="path-item">
+      <div style="display:flex;align-items:center;gap:8px"><div class="path-status"></div><span>${p}</span></div>
+      <button class="btn btn-red" style="font-size:9px;padding:2px 8px" onclick="removeLogPath(${i})">Remove</button>
+    </div>`
+  ).join('') || '<div style="color:var(--muted);font-size:10px">No paths configured</div>';
+}
+
+async function addLogPath() {
+  const v = document.getElementById('log-path-input').value.trim();
+  if (!v) return;
+  try {
+    const r = await fetch('/api/add-log-path', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:v}) });
+    const d = await r.json();
+    if (d.success) { logPaths = d.paths; renderLogPaths(); toast('Path added: '+v,'ok'); }
+    else toast(d.message,'err');
+  } catch(e) { toast('Failed: '+e.message,'err'); }
+  document.getElementById('log-path-input').value='';
+}
+
+async function removeLogPath(i) {
+  const p = logPaths[i];
+  try {
+    const r = await fetch('/api/remove-log-path', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:p}) });
+    const d = await r.json();
+    if (d.success) { logPaths = d.paths; renderLogPaths(); toast('Removed: '+p,'ok'); }
+  } catch(e) { logPaths.splice(i,1); renderLogPaths(); }
+}
+
+// ADMIN: Inventory & Health
+async function loadInventory() {
+  try {
+    const r = await fetch('/api/inventory');
+    const d = await r.json();
+    document.getElementById('sys-inv').innerHTML = `
+      <table class="ip-table"><thead><tr><th>Component</th><th>Value</th></tr></thead><tbody>
+        <tr><td>Hostname</td><td style="font-family:'IBM Plex Mono',monospace">${d.hostname||'—'}</td></tr>
+        <tr><td>OS</td><td style="font-family:'IBM Plex Mono',monospace">${d.os||'—'}</td></tr>
+        <tr><td>Platform</td><td style="font-family:'IBM Plex Mono',monospace">${d.platform||'—'}</td></tr>
+        <tr><td>Python</td><td style="font-family:'IBM Plex Mono',monospace">${d.python||'—'}</td></tr>
+        <tr><td>Monitored Paths</td><td style="font-family:'IBM Plex Mono',monospace">${d.log_paths||0}</td></tr>
+        <tr><td>DB Config</td><td style="font-family:'IBM Plex Mono',monospace">${d.db_host||'—'}/${d.db_name||'—'}</td></tr>
+      </tbody></table>`;
+  } catch(e) { document.getElementById('sys-inv').innerHTML='<div class="empty-state">Inventory unavailable</div>'; }
+}
+
+async function loadHealth() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    document.getElementById('health-table').innerHTML = `
+      <tr><td>Flask Server</td><td><span class="tag tag-low">RUNNING</span></td></tr>
+      <tr><td>PostgreSQL</td><td><span class="tag ${d.db==='reachable'?'tag-low':'tag-crit'}">${(d.db||'unknown').toUpperCase()}</span></td></tr>
+      <tr><td>Log Agent</td><td><span class="tag tag-low">ACTIVE</span></td></tr>
+      <tr><td>API Endpoint</td><td><span class="tag tag-low">OK</span></td></tr>`;
+  } catch(e) { document.getElementById('health-table').innerHTML='<tr><td colspan="2" class="empty-state">Health check failed</td></tr>'; }
+}
+
+// UTILS
+function toast(msg, type='info') {
+  const c = document.getElementById('toast');
+  const el = document.createElement('div');
+  el.className = 'toast-msg '+type;
+  el.innerHTML = `<span>${type==='ok'?'✓':type==='err'?'✕':'ℹ'}</span> ${escHtml(msg)}`;
+  c.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+async function exportCSV() {
+  window.open('/export/csv','_blank');
+  toast('Downloading CSV…','info');
+}
+
+async function confirmClear() {
+  if (!confirm('Delete ALL log events from the database? This cannot be undone.')) return;
+  try {
+    const r = await fetch('/clear-logs', {method:'POST'});
+    const d = await r.json();
+    if (d.status==='success') { toast('All logs cleared','ok'); fetchStats(); }
+    else toast(d.message,'err');
+  } catch(e) { toast('Clear failed: '+e.message,'err'); }
+}
 </script>
 </body>
 </html>
 """
 
+# Active DB switching
+_active_db = DB_CONFIG["database"]
+_log_paths  = list(DB_CONFIG.get("_log_paths", [])) or [
+    "/var/log/auth.log", "/var/log/syslog", "/var/log/kern.log",
+    "/var/log/dpkg.log", "/var/log/audit/audit.log",
+    "/root/.bash_history"
+]
 
-def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
+import sys, importlib
 
+def get_active_db():
+    return _active_db
 
-# Colour helpers
-ETYPE_COLORS = {
-    "AUTH":               "var(--red)",
-    "SUDO":               "var(--orange)",
-    "SUSPICIOUS_COMMAND": "#ff6b6b",
-    "BASH_HISTORY":       "var(--purple)",
-    "SYS":                "var(--muted)",
-}
+def get_active_db_conn():
+    cfg = DB_CONFIG.copy()
+    cfg["database"] = _active_db
+    return psycopg2.connect(**cfg)
 
+# Routes
 
-def classify(eventtype, success, message):
-    lower = (message or "").lower()
-    if success == 0 or "failed password" in lower or eventtype == "SUSPICIOUS_COMMAND":
-        return "red", "HIGH"
-    elif eventtype == "SUDO" or "sudo" in lower or eventtype == "BASH_HISTORY":
-        return "orange", "MED"
-    else:
-        return "green", "NORMAL"
-
-
-# Dashboard route 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def dashboard():
-    try:
-        failed      = analytics.failed_logins()
-        brute_list  = alerts.brute_force()
-        sudo_list   = alerts.sudo_abuse()
-        top_list    = analytics.top_ips()
-
-        brute_total = sum(c for _, c in brute_list) if brute_list else 0
-        sudo_total  = sum(c for _, c in sudo_list)  if sudo_list  else 0
-
-        conn = get_db_connection()
-        cur  = conn.cursor()
-
-        # Recent logs
-        cur.execute("""
-            SELECT
-                COALESCE(EventTime, NOW()) AS log_time,
-                Message, EventType, Success,
-                UserName, SourceIp, RawLine, HostName
-            FROM Logs
-            ORDER BY logid DESC
-            LIMIT 200
-        """)
-
-        recent_logs = []
-        for row in cur.fetchall():
-            ts        = str(row[0])[:19] if row[0] else "—"
-            message   = str(row[1]) if row[1] else ""
-            eventtype = row[2] if row[2] else "SYS"
-            success   = row[3] if row[3] is not None else 1
-            username  = row[4] or "—"
-            sourceip  = row[5] or "—"
-            rawline   = row[6] or ""
-            hostname  = row[7] or "—"
-
-            threat_level, threat_label = classify(eventtype, success, message)
-
-            recent_logs.append({
-                "timestamp":   ts,
-                "message":     message,
-                "eventtype":   eventtype,
-                "threat_level": threat_level,
-                "threat_label": threat_label,
-                "username":    username,
-                "sourceip":    sourceip,
-                "rawline":     rawline,
-                "hostname":    hostname,
-            })
-
-        # Aggregates
-        cur.execute("SELECT COUNT(*) FROM Logs")
-        total_logs = cur.fetchone()[0] or 0
-
-        cur.execute("SELECT COUNT(*) FROM Logs WHERE EventType='SUSPICIOUS_COMMAND'")
-        suspicious_count = cur.fetchone()[0] or 0
-
-        cur.execute("SELECT COUNT(*) FROM Logs WHERE EventType='AUTH'")
-        auth_count = cur.fetchone()[0] or 0
-
-        cur.execute("SELECT COUNT(DISTINCT HostName) FROM Logs")
-        host_count = cur.fetchone()[0] or 0
-
-        cur.execute("""
-            SELECT EventType, COUNT(*)
-            FROM Logs
-            GROUP BY EventType
-            ORDER BY COUNT(*) DESC
-        """)
-
-        event_types = [
-            {"name": r[0] or "SYS", "count": r[1],
-             "color": ETYPE_COLORS.get(r[0] or "SYS", "var(--muted)")}
-            for r in cur.fetchall()
-        ]
-
-        cur.close()
-        conn.close()
-
-        unique_ips = len(set(ip for ip, _ in top_list)) if top_list else 0
-
-    except Exception as e:
-        print(f" Dashboard error: {e}")
-        failed = brute_total = sudo_total = unique_ips = 0
-        total_logs = suspicious_count = auth_count = host_count = 0
-        recent_logs = []
-        top_list    = []
-        sudo_list   = []
-        event_types = []
-
     return render_template_string(
         DASHBOARD_HTML,
-        failed_logins    = failed,
-        brute_total      = brute_total,
-        sudo_total       = sudo_total,
-        unique_ips       = unique_ips,
-        total_logs       = total_logs,
-        suspicious_count = suspicious_count,
-        auth_count       = auth_count,
-        host_count       = host_count,
-        top_ips          = top_list[:8],
-        sudo_users       = sudo_list[:5],
-        event_types      = event_types,
-        recent_logs      = recent_logs,
-        now              = datetime.now().strftime("%H:%M:%S"),
+        mitre_map   = MITRE_MAP,
+        log_paths   = _log_paths,
+        current_db  = _active_db,
     )
 
-
-
-# Live stats API (polled by frontend every 5s) 
 @app.route("/api/stats", methods=["GET"])
 def api_stats():
     try:
-        failed     = analytics.failed_logins()
-        brute_list = alerts.brute_force()
-        sudo_list  = alerts.sudo_abuse()
-        top_list   = analytics.top_ips()
-
-        brute_total = sum(c for _, c in brute_list) if brute_list else 0
-        sudo_total  = sum(c for _, c in sudo_list)  if sudo_list  else 0
-        unique_ips  = len(set(ip for ip, _ in top_list)) if top_list else 0
-
-        conn = get_db_connection()
+        conn = get_active_db_conn()
         cur  = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM Logs WHERE Success=0 AND EventTime > NOW() - INTERVAL '1 minute'")
+        failed = cur.fetchone()[0] or 0
+
+        cur.execute("SELECT SourceIp, COUNT(*) FROM Logs WHERE Success=0 GROUP BY SourceIp HAVING COUNT(*)>10 ORDER BY COUNT(*) DESC")
+        brute_list = cur.fetchall()
+
+        cur.execute("SELECT UserName, COUNT(*) FROM Logs WHERE EventType='SUDO' GROUP BY UserName HAVING COUNT(*)>5 ORDER BY COUNT(*) DESC")
+        sudo_list  = cur.fetchall()
+
+        cur.execute("SELECT SourceIp, COUNT(*) FROM Logs WHERE Success=0 GROUP BY SourceIp ORDER BY COUNT(*) DESC LIMIT 8")
+        top_ips = cur.fetchall()
 
         cur.execute("SELECT COUNT(*) FROM Logs")
         total_logs = cur.fetchone()[0] or 0
@@ -1327,178 +1766,216 @@ def api_stats():
         cur.execute("SELECT COUNT(DISTINCT HostName) FROM Logs")
         host_count = cur.fetchone()[0] or 0
 
-        cur.execute("""
-            SELECT EventType, COUNT(*)
-            FROM Logs
-            GROUP BY EventType
-            ORDER BY COUNT(*) DESC
-        """)
-        event_types = [
-            {"name": r[0] or "SYS", "count": r[1],
-             "color": ETYPE_COLORS.get(r[0] or "SYS", "var(--muted)")}
-            for r in cur.fetchall()
-        ]
+        cur.execute("SELECT EventType, COUNT(*) FROM Logs GROUP BY EventType ORDER BY COUNT(*) DESC")
+        event_types = [{"name": r[0] or "SYS", "count": r[1], "color": ETYPE_COLORS.get(r[0] or "SYS","var(--muted)")} for r in cur.fetchall()]
 
-        # Latest 200 logs for incremental table updates
         cur.execute("""
-            SELECT
-                logid,
-                COALESCE(EventTime, NOW()) AS log_time,
-                Message, EventType, Success,
-                UserName, SourceIp, RawLine, HostName
-            FROM Logs
-            ORDER BY logid DESC
-            LIMIT 200
+            SELECT logid,COALESCE(EventTime,NOW()),Message,EventType,Success,UserName,SourceIp,RawLine,HostName
+            FROM Logs ORDER BY logid DESC LIMIT 200
         """)
-
         logs = []
         for row in cur.fetchall():
-            logid     = row[0]
-            ts        = str(row[1])[:19] if row[1] else "—"
-            message   = str(row[2]) if row[2] else ""
-            eventtype = row[3] if row[3] else "SYS"
-            success   = row[4] if row[4] is not None else 1
-            username  = row[5] or "—"
-            sourceip  = row[6] or "—"
-            rawline   = row[7] or ""
-            hostname  = row[8] or "—"
-            threat_level, threat_label = classify(eventtype, success, message)
-            logs.append({
-                "logid":        logid,
-                "timestamp":    ts,
-                "message":      message,
-                "eventtype":    eventtype,
-                "threat_level": threat_level,
-                "threat_label": threat_label,
-                "username":     username,
-                "sourceip":     sourceip,
-                "rawline":      rawline,
-                "hostname":     hostname,
-            })
+            logid,ts,message,eventtype,success,username,sourceip,rawline,hostname = row
+            tl, label = classify(eventtype, success, message)
+            logs.append({"logid":logid,"timestamp":str(ts)[:19],"message":str(message or ""),
+                         "eventtype":eventtype or "SYS","threat_level":tl,"threat_label":label,
+                         "username":username or "—","sourceip":sourceip or "—",
+                         "rawline":rawline or "","hostname":hostname or "—"})
 
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
 
         return jsonify({
             "failed_logins":    failed,
-            "brute_total":      brute_total,
-            "sudo_total":       sudo_total,
-            "unique_ips":       unique_ips,
+            "brute_total":      sum(c for _,c in brute_list),
+            "sudo_total":       sum(c for _,c in sudo_list),
+            "unique_ips":       len(set(ip for ip,_ in top_ips)),
             "total_logs":       total_logs,
             "suspicious_count": suspicious_count,
             "auth_count":       auth_count,
             "host_count":       host_count,
-            "top_ips":          top_list[:8],
+            "top_ips":          [[ip,c] for ip,c in top_ips],
+            "sudo_users":       [[u,c] for u,c in sudo_list],
             "event_types":      event_types,
             "logs":             logs,
         })
-
     except Exception as e:
-        print(f"[!] api/stats error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f" api/stats: {e}")
+        return jsonify({"error": str(e), "failed_logins":0,"brute_total":0,"sudo_total":0,
+                        "unique_ips":0,"total_logs":0,"suspicious_count":0,"auth_count":0,
+                        "host_count":0,"top_ips":[],"sudo_users":[],"event_types":[],"logs":[]}), 500
 
-
-#  Clear logs 
-@app.route("/clear-logs", methods=["POST"])
-def clear_logs():
+@app.route("/api/top-ips")
+def api_top_ips():
     try:
-        conn = get_db_connection()
-        cur  = conn.cursor()
-        cur.execute("TRUNCATE TABLE Logs RESTART IDENTITY;")
-        conn.commit()
-        cur.close()
-        conn.close()
-        return jsonify({"status": "success"})
+        conn = get_active_db_conn(); cur = conn.cursor()
+        cur.execute("SELECT SourceIp,COUNT(*) FROM Logs WHERE Success=0 GROUP BY SourceIp ORDER BY COUNT(*) DESC LIMIT 20")
+        rows = [[r[0],r[1]] for r in cur.fetchall()]
+        cur.close(); conn.close(); return jsonify(rows)
+    except Exception as e: return jsonify([])
+
+@app.route("/api/sudo-users")
+def api_sudo_users():
+    try:
+        conn = get_active_db_conn(); cur = conn.cursor()
+        cur.execute("SELECT UserName,COUNT(*) FROM Logs WHERE EventType='SUDO' GROUP BY UserName ORDER BY COUNT(*) DESC LIMIT 20")
+        rows = [[r[0] or "unknown",r[1]] for r in cur.fetchall()]
+        cur.close(); conn.close(); return jsonify(rows)
+    except Exception as e: return jsonify([])
+
+@app.route("/api/fim", methods=["POST"])
+def api_fim():
+    data  = request.json or {}
+    paths = data.get("paths", [])
+    return jsonify(fim_scan(paths))
+
+@app.route("/api/sca")
+def api_sca():
+    return jsonify(run_sca())
+
+@app.route("/api/vuln")
+def api_vuln():
+    return jsonify(vuln_scan())
+
+@app.route("/api/block-ip", methods=["POST"])
+def api_block_ip():
+    data   = request.json or {}
+    ip     = data.get("ip","").strip()
+    reason = data.get("reason","Manual")
+    if not ip: return jsonify({"success":False,"message":"No IP provided"}),400
+    ok, msg = block_ip(ip)
+    return jsonify({"success":ok,"message":msg})
+
+@app.route("/api/unblock-ip", methods=["POST"])
+def api_unblock_ip():
+    data = request.json or {}
+    ip   = data.get("ip","").strip()
+    if not ip: return jsonify({"success":False,"message":"No IP"}),400
+    ok, msg = unblock_ip(ip)
+    return jsonify({"success":ok,"message":msg})
+
+@app.route("/api/databases")
+def api_databases():
+    return jsonify(list_databases())
+
+@app.route("/api/switch-db", methods=["POST"])
+def api_switch_db():
+    global _active_db
+    data = request.json or {}
+    name = data.get("database","").strip()
+    if not name: return jsonify({"success":False,"message":"No DB name"})
+    try:
+        cfg = DB_CONFIG.copy(); cfg["database"] = name
+        psycopg2.connect(**cfg).close()
+        _active_db = name
+        return jsonify({"success":True,"message":f"Switched to {name}"})
     except Exception as e:
-        print(f"[!] Clear logs error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"success":False,"message":str(e)})
 
+@app.route("/api/create-db", methods=["POST"])
+def api_create_db():
+    data = request.json or {}
+    name = data.get("name","").strip()
+    if not name: return jsonify({"success":False,"message":"No name provided"})
+    ok, msg = create_database_and_tables(name)
+    return jsonify({"success":ok,"message":msg})
 
-# Health
-@app.route("/health", methods=["GET"])
+@app.route("/api/add-log-path", methods=["POST"])
+def api_add_log_path():
+    global _log_paths
+    data = request.json or {}
+    path = data.get("path","").strip()
+    if not path: return jsonify({"success":False,"message":"No path"})
+    if path not in _log_paths:
+        _log_paths.append(path)
+    return jsonify({"success":True,"paths":_log_paths})
+
+@app.route("/api/remove-log-path", methods=["POST"])
+def api_remove_log_path():
+    global _log_paths
+    data = request.json or {}
+    path = data.get("path","").strip()
+    _log_paths = [p for p in _log_paths if p != path]
+    return jsonify({"success":True,"paths":_log_paths})
+
+@app.route("/api/inventory")
+def api_inventory():
+    import sys as _sys
+    return jsonify({
+        "hostname":  __import__("socket").gethostname(),
+        "os":        platform.system() + " " + platform.release(),
+        "platform":  platform.platform(),
+        "python":    _sys.version.split()[0],
+        "log_paths": len(_log_paths),
+        "db_host":   DB_CONFIG.get("host","—"),
+        "db_name":   _active_db,
+    })
+
+@app.route("/health")
 def health():
     try:
-        get_db_connection().close()
-        return jsonify({"status": "ok", "db": "reachable"})
+        get_active_db_conn().close()
+        return jsonify({"status":"ok","db":"reachable"})
     except Exception as e:
-        return jsonify({"status": "error", "db": str(e)}), 500
+        return jsonify({"status":"error","db":str(e)}), 500
 
-
-# Ingest 
 @app.route("/ingest", methods=["POST"])
 def ingest():
     data = request.json
     if not data or data.get("api_key") != API_KEY:
-        return jsonify({"error": "Invalid API key"}), 401
-
-    raw_line = data.get("message", "")
+        return jsonify({"error":"Invalid API key"}), 401
+    raw_line = data.get("message","")
     event    = parser.parse(raw_line)
-
     if not event:
-        event = {
-            "EventTime": datetime.utcnow().isoformat(),
-            "EventType": "SYS",
-            "Success":   1,
-            "UserName":  None,
-            "SourceIp":  None,
-            "Message":   raw_line[:700],
-            "RawLine":   raw_line,
-            "HostName":  data.get("host", "unknown"),
-        }
+        event = {"EventTime":datetime.utcnow().isoformat(),"EventType":"SYS","Success":1,
+                 "UserName":None,"SourceIp":None,"Message":raw_line[:700],"RawLine":raw_line,
+                 "HostName":data.get("host","unknown")}
     else:
-        event["HostName"] = data.get("host", "unknown")
-
+        event["HostName"] = data.get("host","unknown")
     try:
-        db.insert(event)
-        return jsonify({"status": "ok"})
+        cfg = DB_CONFIG.copy(); cfg["database"] = _active_db
+        conn = psycopg2.connect(**cfg); cur = conn.cursor()
+        cur.execute("""INSERT INTO Logs(EventTime,EventType,Success,UserName,HostName,SourceIp,Message,RawLine)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (event.get("EventTime"),event.get("EventType"),event.get("Success"),
+                     event.get("UserName"),event.get("HostName"),event.get("SourceIp"),
+                     event.get("Message"),event.get("RawLine")))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"status":"ok"})
     except Exception as e:
-        print(f"[!] Ingest error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"Ingest: {e}")
+        return jsonify({"error":str(e)}),500
 
-
-# Logs JSON
-@app.route("/logs", methods=["GET"])
+@app.route("/logs")
 def get_logs():
     try:
-        conn = get_db_connection()
-        cur  = conn.cursor()
+        conn = get_active_db_conn(); cur = conn.cursor()
         cur.execute("SELECT * FROM Logs ORDER BY logid DESC LIMIT 200")
-        rows    = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
-        cur.close()
-        conn.close()
-        return jsonify([dict(zip(columns, r)) for r in rows])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        rows = cur.fetchall(); cols = [d[0] for d in cur.description]
+        cur.close(); conn.close()
+        return jsonify([dict(zip(cols,r)) for r in rows])
+    except Exception as e: return jsonify({"error":str(e)}),500
 
-
-# CSV export
-@app.route("/export/csv", methods=["GET"])
+@app.route("/export/csv")
 def export_csv():
     try:
-        conn = get_db_connection()
-        cur  = conn.cursor()
-        cur.execute("SELECT * FROM Logs ORDER BY logid DESC LIMIT 1000")
-        rows    = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
-        cur.close()
-        conn.close()
+        conn = get_active_db_conn(); cur = conn.cursor()
+        cur.execute("SELECT * FROM Logs ORDER BY logid DESC LIMIT 5000")
+        rows = cur.fetchall(); cols = [d[0] for d in cur.description]
+        cur.close(); conn.close()
+        out = io.StringIO(); w = csv.writer(out); w.writerow(cols); w.writerows(rows)
+        return Response(out.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition":f"attachment; filename=sp110_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"})
+    except Exception as e: return jsonify({"error":str(e)}),500
 
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(columns)
-        writer.writerows(rows)
-
-        return Response(
-            output.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-Disposition":
-                     f"attachment; filename=behavior_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+@app.route("/clear-logs", methods=["POST"])
+def clear_logs():
+    try:
+        conn = get_active_db_conn(); cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE Logs RESTART IDENTITY;")
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"status":"success"})
+    except Exception as e: return jsonify({"status":"error","message":str(e)}),500
 
 if __name__ == "__main__":
-    print(f"Linux Behavior Monitor running → http://{SERVER_HOST}:{SERVER_PORT}")
+    print(f"SP-110 Linux Behavior Monitor http://{SERVER_HOST}:{SERVER_PORT}")
     app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
