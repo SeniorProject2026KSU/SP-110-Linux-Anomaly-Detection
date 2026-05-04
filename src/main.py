@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import os
 
 from user_notification.notification_manager import NotificationManager
+from isolation_forest.isolation_forest import IsolationForest
 
 def build_config():
     return {
@@ -34,7 +35,9 @@ def main():
     notifier.set_user_name("CHANGEME")
     notifier.set_user_device("Laptop")
 
-    notifier.send_anomaly_notification(85)
+    forest = IsolationForest()
+    forest.add_notification_module(notifier)
+    forest.run()
 
 if __name__ == "__main__":
     main()
